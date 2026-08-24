@@ -1252,21 +1252,22 @@ int arm_get_gdb_reg_list(struct target *target,
 		return ERROR_OK;
 
 	case REG_CLASS_ALL:
-		switch (arm->core_type) {
-		case ARM_CORE_TYPE_SEC_EXT:
-			*reg_list_size = 51;
-			break;
-		case ARM_CORE_TYPE_VIRT_EXT:
-			*reg_list_size = 53;
-			break;
-		default:
-			*reg_list_size = 48;
+		if (arm->arm_vfp_version == ARM_VFP_V3) {
+			*reg_list_size = ARM_VFP_V3_FPSCR + 1;
+		} else {
+			switch (arm->core_type) {
+			case ARM_CORE_TYPE_SEC_EXT:
+				*reg_list_size = 51;
+				break;
+			case ARM_CORE_TYPE_VIRT_EXT:
+				*reg_list_size = 53;
+				break;
+			default:
+				*reg_list_size = 48;
+			}
 		}
-		unsigned int list_size_core = *reg_list_size;
-		if (arm->arm_vfp_version == ARM_VFP_V3)
-			*reg_list_size += 33;
 
-		*reg_list = malloc(sizeof(struct reg *) * (*reg_list_size));
+		*reg_list = calloc(*reg_list_size, sizeof(struct reg *));
 
 		for (i = 0; i < 16; i++)
 			(*reg_list)[i] = arm_reg_current(arm, i);
@@ -1294,8 +1295,15 @@ int arm_get_gdb_reg_list(struct target *target,
 
 		if (arm->arm_vfp_version == ARM_VFP_V3) {
 			unsigned int num_core_regs = ARRAY_SIZE(arm_core_regs);
-			for (i = 0; i < 33; i++)
-				(*reg_list)[list_size_core + i] = &(arm->core_cache->reg_list[num_core_regs + i]);
+			for (i = 0; i < 33; i++) {
+				int reg_index = arm->core_cache->reg_list[num_core_regs + i].number;
+				(*reg_list)[reg_index] = &(arm->core_cache->reg_list[num_core_regs + i]);
+			}
+		}
+
+		for (i = 0; i < (unsigned int)*reg_list_size; i++) {
+			if (!(*reg_list)[i])
+				(*reg_list)[i] = &arm_gdb_dummy_fp_reg;
 		}
 
 		return ERROR_OK;
