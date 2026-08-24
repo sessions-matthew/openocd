@@ -94,6 +94,10 @@ struct armv7a_common {
 	struct arm_dpm dpm;
 	target_addr_t debug_base;
 	struct adiv5_ap *debug_ap;
+	/* AHB/AXI system-bus AP for non-intrusive (no-halt) memory access.
+	 * Populated during examine when an AHB3/AHB5/AXI AP is found.
+	 * NULL when unavailable. */
+	struct adiv5_ap *system_ap;
 	/* mdir */
 	uint8_t multi_processor_system;
 	uint8_t multi_threading_processor;

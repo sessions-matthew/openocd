@@ -10,6 +10,7 @@
 
 #include <helper/log.h>
 #include <target/rtt.h>
+#include <target/cortex_a.h>
 
 #include "rtt.h"
 
@@ -42,7 +43,64 @@ COMMAND_HANDLER(handle_rtt_setup_command)
 	COMMAND_PARSE_NUMBER(target_addr, CMD_ARGV[0], address);
 	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], size);
 
-	rtt_register_source(source, get_current_target(CMD_CTX));
+	struct target *target = get_current_target(CMD_CTX);
+
+	/* For Cortex-A targets that expose an AHB/AXI system-bus AP, automatically
+	 * use the non-intrusive source so RTT polling never requires a CPU halt.
+	 * Falls back to the halt-based source if unavailable (non-Cortex-A, or no AHB-AP). */
+	int ret = cortex_a_register_rtt_nonintrusive(target);
+	if (ret == ERROR_TARGET_RESOURCE_NOT_AVAILABLE) {
+		/* No AHB-AP or not a Cortex-A target: use halt-based source */
+		rtt_register_source(source, target);
+	} else if (ret != ERROR_OK) {
+		return ret;
+	}
+	/* ret == ERROR_OK: NI source already registered by cortex_a_register_rtt_nonintrusive() */
+
+	if (rtt_setup(address, size, selected_id) != ERROR_OK)
+		return ERROR_FAIL;
+
+	return ERROR_OK;
+}
+
+COMMAND_HANDLER(handle_rtt_setup_ni_command)
+{
+	const char *DEFAULT_ID = "SEGGER RTT";
+	const char *selected_id;
+	if (CMD_ARGC < 2 || CMD_ARGC > 3)
+		return ERROR_COMMAND_SYNTAX_ERROR;
+	if (CMD_ARGC == 2)
+		selected_id = DEFAULT_ID;
+	else
+		selected_id = CMD_ARGV[2];
+
+	target_addr_t address;
+	uint32_t size;
+
+	COMMAND_PARSE_NUMBER(target_addr, CMD_ARGV[0], address);
+	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], size);
+
+	struct target *target = get_current_target(CMD_CTX);
+
+	/* Try non-intrusive AHB-AP source first (Cortex-A only).
+	 * Falls back to the standard halt-based source if unavailable. */
+	int ret = cortex_a_register_rtt_nonintrusive(target);
+	if (ret == ERROR_TARGET_RESOURCE_NOT_AVAILABLE) {
+		/* Graceful fallback: no AHB-AP or not a Cortex-A — use halt-based */
+		LOG_WARNING("rtt setup_ni: non-intrusive source unavailable, "
+			"falling back to halt-based RTT");
+		struct rtt_source source;
+		source.find_cb = &target_rtt_find_control_block;
+		source.read_cb = &target_rtt_read_control_block;
+		source.start = &target_rtt_start;
+		source.stop = &target_rtt_stop;
+		source.read = &target_rtt_read_callback;
+		source.write = &target_rtt_write_callback;
+		source.read_channel_info = &target_rtt_read_channel_info;
+		rtt_register_source(source, target);
+	} else if (ret != ERROR_OK) {
+		return ret;
+	}
 
 	if (rtt_setup(address, size, selected_id) != ERROR_OK)
 		return ERROR_FAIL;
@@ -223,7 +281,14 @@ static const struct command_registration rtt_subcommand_handlers[] = {
 		.name = "setup",
 		.handler = handle_rtt_setup_command,
 		.mode = COMMAND_ANY,
-		.help = "setup RTT",
+		.help = "setup RTT (halt-based)",
+		.usage = "<address> <size> [ID]"
+	},
+	{
+		.name = "setup_ni",
+		.handler = handle_rtt_setup_ni_command,
+		.mode = COMMAND_ANY,
+		.help = "setup non-intrusive RTT via AHB-AP (Cortex-A); falls back to halt-based if AHB-AP unavailable",
 		.usage = "<address> <size> [ID]"
 	},
 	{

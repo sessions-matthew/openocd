@@ -107,4 +107,11 @@ target_to_cortex_a(struct target *target)
 	return container_of(target->arch_info, struct cortex_a_common, armv7a_common.arm);
 }
 
+/**
+ * Register the non-intrusive AHB-AP RTT source for @target.
+ * Returns ERROR_TARGET_RESOURCE_NOT_AVAILABLE if no AHB/AXI AP was detected
+ * during examine (graceful fallback to halt-based RTT).
+ */
+int cortex_a_register_rtt_nonintrusive(struct target *target);
+
 #endif /* OPENOCD_TARGET_CORTEX_A_H */

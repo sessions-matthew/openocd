@@ -56,6 +56,8 @@
 #include <helper/nvp.h>
 #include <helper/time_support.h>
 #include <helper/align.h>
+#include <rtt/rtt.h>
+#include "rtt.h"
 
 static int cortex_a_poll(struct target *target);
 static int cortex_a_debug_entry(struct target *target);
@@ -3010,6 +3012,26 @@ static int cortex_a_examine_first(struct target *target)
 
 	armv7a->debug_ap->memaccess_tck = 80;
 
+	/* Probe for an AHB/AXI system-bus AP for non-intrusive (no-halt) access.
+	 * Best-effort: absence is not fatal — non-intrusive RTT simply won't work. */
+	if (!armv7a->system_ap) {
+		struct adiv5_ap *ahb_ap = NULL;
+		if (dap_find_get_ap(swjdp, AP_TYPE_AHB3_AP, &ahb_ap) == ERROR_OK ||
+		    dap_find_get_ap(swjdp, AP_TYPE_AHB5_AP, &ahb_ap) == ERROR_OK ||
+		    dap_find_get_ap(swjdp, AP_TYPE_AXI_AP,  &ahb_ap) == ERROR_OK) {
+			if (mem_ap_init(ahb_ap) == ERROR_OK) {
+				armv7a->system_ap = ahb_ap;
+				LOG_TARGET_DEBUG(target, "Non-intrusive RTT: AHB/AXI AP found (AP#%" PRIu64 ")",
+							 ahb_ap->ap_num);
+			} else {
+				dap_put_ap(ahb_ap);
+				LOG_TARGET_DEBUG(target, "Non-intrusive RTT: AHB/AXI AP init failed, falling back to halt-based RTT");
+			}
+		} else {
+			LOG_TARGET_DEBUG(target, "Non-intrusive RTT: no AHB/AXI AP found, halt-based RTT only");
+		}
+	}
+
 	if (!target->dbgbase_set) {
 		LOG_TARGET_DEBUG(target, "dbgbase is not set, trying to detect using the ROM table");
 		/* Lookup Processor DAP */
@@ -3214,6 +3236,286 @@ static int cortex_a_init_arch_info(struct target *target,
 	return ERROR_OK;
 }
 
+/*
+ * ============================================================
+ * Non-intrusive RTT via AHB-AP (system bus)
+ *
+ * All callbacks use mem_ap_read/write_buf() through system_ap
+ * instead of the CPU instruction-injection path, so the CPU
+ * never needs to halt for RTT polling.
+ * ============================================================
+ */
+
+/* Helper: read bytes via AHB-AP without halting the CPU. */
+static int cortex_a_ni_read_buf(struct target *target, target_addr_t addr,
+		uint32_t size, uint32_t count, uint8_t *buf)
+{
+	struct armv7a_common *armv7a = target_to_armv7a(target);
+	if (!armv7a->system_ap)
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	return mem_ap_read_buf(armv7a->system_ap, buf, size, count, addr);
+}
+
+/* Helper: write bytes via AHB-AP without halting the CPU. */
+static int cortex_a_ni_write_buf(struct target *target, target_addr_t addr,
+		uint32_t size, uint32_t count, const uint8_t *buf)
+{
+	struct armv7a_common *armv7a = target_to_armv7a(target);
+	if (!armv7a->system_ap)
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	return mem_ap_write_buf(armv7a->system_ap, buf, size, count, addr);
+}
+
+static int cortex_a_rtt_find_cb(struct target *target, target_addr_t *address,
+		size_t size, const char *id, bool *found, void *user_data)
+{
+	target_addr_t address_end = *address + size;
+	uint8_t buf[1024];
+	size_t id_matched = 0;
+	const size_t id_len = strlen(id);
+
+	*found = false;
+	LOG_INFO("rtt(ni): Searching for control block '%s'", id);
+
+	for (target_addr_t addr = *address; addr < address_end; addr += sizeof(buf)) {
+		const size_t buf_size = MIN(sizeof(buf), (size_t)(address_end - addr));
+		if (cortex_a_ni_read_buf(target, addr, 1, buf_size, buf) != ERROR_OK)
+			return ERROR_FAIL;
+
+		for (size_t off = 0; off < buf_size; off++) {
+			if (id_matched > 0 && buf[off] != id[id_matched])
+				id_matched = 0;
+			if (buf[off] == id[id_matched])
+				id_matched++;
+			if (id_matched == id_len) {
+				*address = addr + off + 1 - id_len;
+				*found = true;
+				return ERROR_OK;
+			}
+		}
+	}
+	return ERROR_OK;
+}
+
+static int cortex_a_rtt_read_cb(struct target *target, target_addr_t address,
+		struct rtt_control *ctrl, void *user_data)
+{
+	uint8_t buf[RTT_CB_SIZE];
+	if (cortex_a_ni_read_buf(target, address, 1, RTT_CB_SIZE, buf) != ERROR_OK)
+		return ERROR_FAIL;
+	memcpy(ctrl->id, buf, RTT_CB_MAX_ID_LENGTH);
+	ctrl->id[RTT_CB_MAX_ID_LENGTH - 1] = '\0';
+	ctrl->num_up_channels   = target_buffer_get_u32(target, buf + RTT_CB_MAX_ID_LENGTH + 0);
+	ctrl->num_down_channels = target_buffer_get_u32(target, buf + RTT_CB_MAX_ID_LENGTH + 4);
+	return ERROR_OK;
+}
+
+static int cortex_a_rtt_start(struct target *target,
+		const struct rtt_control *ctrl, void *user_data)
+{
+	return ERROR_OK; /* nothing to configure on the hardware side */
+}
+
+static int cortex_a_rtt_stop(struct target *target, void *user_data)
+{
+	return ERROR_OK;
+}
+
+/* Read one RTT up-channel descriptor via AHB-AP and populate @channel. */
+static int cortex_a_rtt_read_channel_desc(struct target *target,
+		const struct rtt_control *ctrl, unsigned int idx,
+		enum rtt_channel_type type, struct rtt_channel *channel)
+{
+	const uint32_t ch_size = RTT_CHANNEL_SIZE_32; /* AM335x is 32-bit */
+	target_addr_t base = ctrl->address + RTT_CB_SIZE;
+	uint32_t n_ch = (type == RTT_CHANNEL_TYPE_UP) ?
+		ctrl->num_up_channels : ctrl->num_down_channels;
+
+	if (type == RTT_CHANNEL_TYPE_DOWN)
+		base += (target_addr_t)ctrl->num_up_channels * ch_size;
+
+	if (idx >= n_ch)
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+
+	target_addr_t ch_addr = base + (target_addr_t)idx * ch_size;
+	uint8_t buf[RTT_CHANNEL_SIZE_32];
+
+	if (cortex_a_ni_read_buf(target, ch_addr, 1, RTT_CHANNEL_SIZE_32, buf) != ERROR_OK)
+		return ERROR_FAIL;
+
+	channel->address   = ch_addr;
+	channel->name_addr = target_buffer_get_u32(target, buf + 0);
+	channel->buffer_addr = target_buffer_get_u32(target, buf + 4);
+	channel->size      = target_buffer_get_u32(target, buf + 8);
+	channel->write_pos = target_buffer_get_u32(target, buf + 12);
+	channel->read_pos  = target_buffer_get_u32(target, buf + 16);
+	channel->flags     = target_buffer_get_u32(target, buf + 20);
+	return ERROR_OK;
+}
+
+static int cortex_a_rtt_read_channel_info(struct target *target,
+		const struct rtt_control *ctrl, unsigned int channel_index,
+		enum rtt_channel_type type, struct rtt_channel_info *info,
+		void *user_data)
+{
+	struct rtt_channel ch;
+	if (cortex_a_rtt_read_channel_desc(target, ctrl, channel_index, type, &ch) != ERROR_OK)
+		return ERROR_FAIL;
+
+	info->size  = ch.size;
+	info->flags = ch.flags;
+
+	if (!ch.size || !ch.name_addr)
+		return ERROR_OK;
+
+	/* Read channel name via AHB-AP */
+	return cortex_a_ni_read_buf(target, ch.name_addr, 1,
+			(uint32_t)info->name_length - 1, (uint8_t *)info->name);
+}
+
+static int cortex_a_rtt_read(struct target *target,
+		const struct rtt_control *ctrl, struct rtt_sink_list **sinks,
+		size_t num_channels, void *user_data)
+{
+	size_t n = MIN(num_channels, (size_t)ctrl->num_up_channels);
+
+	for (size_t i = 0; i < n; i++) {
+		if (!sinks[i])
+			continue;
+
+		struct rtt_channel ch;
+		if (cortex_a_rtt_read_channel_desc(target, ctrl, i,
+				RTT_CHANNEL_TYPE_UP, &ch) != ERROR_OK)
+			return ERROR_FAIL;
+
+		if (!ch.size || !ch.buffer_addr || ch.read_pos == ch.write_pos)
+			continue;
+
+		/* How many bytes are available? */
+		uint8_t buf[1024];
+		uint32_t len;
+
+		if (ch.read_pos < ch.write_pos) {
+			len = MIN((uint32_t)sizeof(buf), ch.write_pos - ch.read_pos);
+			if (cortex_a_ni_read_buf(target,
+					ch.buffer_addr + ch.read_pos, 1, len, buf) != ERROR_OK)
+				return ERROR_FAIL;
+		} else {
+			/* Wrap-around: read to end then from start */
+			uint32_t first = MIN((uint32_t)sizeof(buf), ch.size - ch.read_pos);
+			if (cortex_a_ni_read_buf(target,
+					ch.buffer_addr + ch.read_pos, 1, first, buf) != ERROR_OK)
+				return ERROR_FAIL;
+			uint32_t second = MIN((uint32_t)sizeof(buf) - first,
+					ch.write_pos);
+			if (second && cortex_a_ni_read_buf(target,
+					ch.buffer_addr, 1, second, buf + first) != ERROR_OK)
+				return ERROR_FAIL;
+			len = first + second;
+		}
+
+		/* Deliver to all registered sinks */
+		for (struct rtt_sink_list *s = sinks[i]; s; s = s->next)
+			s->read(i, buf, len, s->user_data);
+
+		/* Advance read pointer atomically via AHB-AP */
+		uint8_t rp_buf[4];
+		target_buffer_set_u32(target, rp_buf,
+				(ch.read_pos + len) % ch.size);
+		cortex_a_ni_write_buf(target,
+				ch.address + 16 /* read_pos offset */, 4, 1, rp_buf);
+	}
+	return ERROR_OK;
+}
+
+static int cortex_a_rtt_write(struct target *target,
+		struct rtt_control *ctrl, unsigned int channel_index,
+		const uint8_t *buffer, size_t *length, void *user_data)
+{
+	if (channel_index >= ctrl->num_down_channels) {
+		LOG_WARNING("rtt(ni): Down-channel %u not available", channel_index);
+		return ERROR_OK;
+	}
+
+	struct rtt_channel ch;
+	if (cortex_a_rtt_read_channel_desc(target, ctrl, channel_index,
+			RTT_CHANNEL_TYPE_DOWN, &ch) != ERROR_OK)
+		return ERROR_FAIL;
+
+	if (!ch.size || !ch.buffer_addr) {
+		*length = 0;
+		return ERROR_OK;
+	}
+
+	/* Simple non-blocking write: fill free space */
+	uint32_t free_space = (ch.read_pos > ch.write_pos)
+		? ch.read_pos - ch.write_pos - 1
+		: ch.size - ch.write_pos + ch.read_pos - 1;
+
+	uint32_t to_write = MIN((uint32_t)*length, free_space);
+	if (!to_write) {
+		*length = 0;
+		return ERROR_OK;
+	}
+
+	uint32_t first = MIN(to_write, ch.size - ch.write_pos);
+	if (cortex_a_ni_write_buf(target,
+			ch.buffer_addr + ch.write_pos, 1, first, buffer) != ERROR_OK)
+		return ERROR_FAIL;
+
+	if (first < to_write) {
+		if (cortex_a_ni_write_buf(target,
+				ch.buffer_addr, 1, to_write - first,
+				buffer + first) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+
+	/* Update write pointer */
+	uint8_t wp_buf[4];
+	target_buffer_set_u32(target, wp_buf,
+			(ch.write_pos + to_write) % ch.size);
+	cortex_a_ni_write_buf(target,
+			ch.address + 12 /* write_pos offset */, 4, 1, wp_buf);
+
+	*length = to_write;
+	return ERROR_OK;
+}
+
+/**
+ * Register the non-intrusive AHB-AP RTT source for @target.
+ * Called from the TCL "rtt setup_ni" command handler.
+ * Falls back gracefully if system_ap is absent (i.e., the board
+ * doesn't expose an AHB-AP), in which case a warning is logged.
+ */
+int cortex_a_register_rtt_nonintrusive(struct target *target)
+{
+	struct armv7a_common *armv7a = target_to_armv7a(target);
+
+	if (!armv7a->system_ap) {
+		LOG_TARGET_WARNING(target,
+			"Non-intrusive RTT requested but no AHB/AXI AP was found "
+			"during examine. RTT will fall back to halt-based access.");
+		/* Fall back: let the caller register the standard source instead */
+		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	}
+
+	const struct rtt_source ni_src = {
+		.find_cb          = cortex_a_rtt_find_cb,
+		.read_cb          = cortex_a_rtt_read_cb,
+		.read_channel_info = cortex_a_rtt_read_channel_info,
+		.start            = cortex_a_rtt_start,
+		.stop             = cortex_a_rtt_stop,
+		.read             = cortex_a_rtt_read,
+		.write            = cortex_a_rtt_write,
+	};
+
+	LOG_TARGET_INFO(target,
+		"Non-intrusive RTT enabled via AHB-AP #%" PRIu64,
+		armv7a->system_ap->ap_num);
+
+	return rtt_register_source(ni_src, target);
+}
+
 static int cortex_a_target_create(struct target *target)
 {
 	struct cortex_a_common *cortex_a;
@@ -3273,6 +3575,9 @@ static void cortex_a_deinit_target(struct target *target)
 					armv7a->debug_base + CPUDBG_DSCR,
 					dscr & ~DSCR_HALT_DBG_MODE);
 	}
+
+	if (armv7a->system_ap)
+		dap_put_ap(armv7a->system_ap);
 
 	if (armv7a->debug_ap)
 		dap_put_ap(armv7a->debug_ap);
