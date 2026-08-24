@@ -6005,7 +6005,9 @@ COMMAND_HANDLER(handle_target_create)
 	/* append to end of list */
 	append_to_list_all_targets(target);
 
-	CMD_CTX->current_target = target;
+	bool is_gdb_disabled = target->gdb_port_override && !strcmp(target->gdb_port_override, "disabled");
+	if (!CMD_CTX->current_target || !is_gdb_disabled)
+		CMD_CTX->current_target = target;
 	return ERROR_OK;
 }
 

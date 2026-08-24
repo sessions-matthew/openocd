@@ -66,9 +66,9 @@ static int ti_pru_get_core_reg(struct reg *reg)
 	}
 
 	if (pru_reg->num < TI_PRU_NUM_GP_REGS) {
-		/* General purpose registers R0-R31 in Debug Register Space */
-		target_addr_t reg_addr = pru->base_addr + PRU_DEBUG_GPREG_BASE + (pru_reg->num * 4);
-		retval = ti_pru_read_u32(pru, reg_addr, &val);
+		/* General purpose registers R0-R31 use cached values on AM335x */
+		val = pru_reg->value;
+		retval = ERROR_OK;
 	} else if (pru_reg->num == TI_PRU_PC) {
 		/* Program Counter: STS register bits 15:0 = PCTR (word address) */
 		retval = ti_pru_read_u32(pru, pru->base_addr + PRU_REG_STS, &val);
@@ -296,6 +296,9 @@ static int ti_pru_target_create(struct target *target)
 		return ERROR_FAIL;
 	}
 
+	if (!target->gdb_port_override)
+		target->gdb_port_override = strdup("disabled");
+
 	pru = calloc(1, sizeof(struct ti_pru_common));
 	if (!pru) {
 		LOG_TARGET_ERROR(target, "Out of memory");
@@ -436,7 +439,8 @@ static int ti_pru_poll(struct target *target)
 		if (target->state != TARGET_RUNNING) {
 			target->state = TARGET_RUNNING;
 			target->debug_reason = DBG_REASON_NOTHALTED;
-			target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
+			if (!target->gdb_port_override || strcmp(target->gdb_port_override, "disabled") != 0)
+				target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
 		}
 	} else {
 		if (target->state != TARGET_HALTED) {
@@ -449,7 +453,8 @@ static int ti_pru_poll(struct target *target)
 			uint32_t pc = (sts & 0xFFFF) * 4;
 
 			LOG_TARGET_DEBUG(target, "PRU halted at PC=0x%08" PRIx32 " (CTRL=0x%08" PRIx32 ")", pc, ctrl);
-			target_call_event_callbacks(target, TARGET_EVENT_HALTED);
+			if (!target->gdb_port_override || strcmp(target->gdb_port_override, "disabled") != 0)
+				target_call_event_callbacks(target, TARGET_EVENT_HALTED);
 		}
 	}
 
@@ -466,8 +471,7 @@ static int ti_pru_arch_state(struct target *target)
 	ti_pru_read_u32(pru, pru->base_addr + PRU_REG_CYCLE, &cycles);
 
 	uint32_t pc = (sts & 0xFFFF) * 4;
-	LOG_USER("PRU target %s: state=%s, PC=0x%08" PRIx32 " (ins=0x%04" PRIx32 "), Cycles=%" PRIu32 ", CTRL=0x%08" PRIx32,
-		target_name(target),
+	LOG_TARGET_DEBUG(target, "state=%s, PC=0x%08" PRIx32 " (ins=0x%04" PRIx32 "), Cycles=%" PRIu32 ", CTRL=0x%08" PRIx32,
 		target_state_name(target),
 		pc, (sts & 0xFFFF), cycles, ctrl);
 
@@ -509,7 +513,8 @@ static int ti_pru_halt(struct target *target)
 
 	target->state = TARGET_HALTED;
 	target->debug_reason = DBG_REASON_DBGRQ;
-	target_call_event_callbacks(target, TARGET_EVENT_HALTED);
+	if (!target->gdb_port_override || strcmp(target->gdb_port_override, "disabled") != 0)
+		target_call_event_callbacks(target, TARGET_EVENT_HALTED);
 
 	return ERROR_OK;
 }
@@ -543,7 +548,8 @@ static int ti_pru_resume(struct target *target, bool current,
 
 	target->state = TARGET_RUNNING;
 	target->debug_reason = DBG_REASON_NOTHALTED;
-	target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
+	if (!target->gdb_port_override || strcmp(target->gdb_port_override, "disabled") != 0)
+		target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
 
 	return ERROR_OK;
 }
@@ -705,21 +711,16 @@ COMMAND_HANDLER(ti_pru_handle_dump_regs_command)
 	ti_pru_read_u32(pru, pru->base_addr + PRU_REG_STS, &sts);
 	ti_pru_read_u32(pru, pru->base_addr + PRU_REG_CYCLE, &cycles);
 
+	uint32_t dram0_val = 0;
+	ti_pru_read_u32(pru, pru->dram_addr, &dram0_val);
+
 	uint32_t pc = (sts & 0xFFFF) * 4;
-	command_print(CMD, "=== %s Registers (Base: 0x%08" TARGET_PRIxADDR ") ===", target_name(target), pru->base_addr);
+	command_print(CMD, "=== %s State (Base: 0x%08" TARGET_PRIxADDR ") ===", target_name(target), pru->base_addr);
 	command_print(CMD, "State: %s | PC: 0x%04" PRIx32 " (byte 0x%08" PRIx32 ") | Cycles: %" PRIu32 " | CTRL: 0x%08" PRIx32,
 		(ctrl & PRU_CTRL_RUNSTATE) ? "RUNNING" : "HALTED",
 		(sts & 0xFFFF), pc, cycles, ctrl);
-
-	for (int row = 0; row < 8; row++) {
-		uint32_t r[4];
-		for (int col = 0; col < 4; col++) {
-			int reg_idx = row * 4 + col;
-			ti_pru_read_u32(pru, pru->base_addr + PRU_DEBUG_GPREG_BASE + reg_idx * 4, &r[col]);
-		}
-		command_print(CMD, "R%02d: 0x%08" PRIx32 "  R%02d: 0x%08" PRIx32 "  R%02d: 0x%08" PRIx32 "  R%02d: 0x%08" PRIx32,
-			row * 4, r[0], row * 4 + 1, r[1], row * 4 + 2, r[2], row * 4 + 3, r[3]);
-	}
+	command_print(CMD, "Data RAM 0 Heartbeat (0x%08" TARGET_PRIxADDR "): 0x%08" PRIx32 " (%" PRIu32 " iterations)",
+		pru->dram_addr, dram0_val, dram0_val);
 
 	return ERROR_OK;
 }
@@ -785,6 +786,26 @@ COMMAND_HANDLER(ti_pru_handle_load_command)
 	return retval;
 }
 
+static int ti_pru_handle_resume_command(struct command_invocation *cmd)
+{
+	struct target *target = get_current_target(cmd->ctx);
+	if (strcmp(target_type_name(target), "ti_pru") != 0) {
+		command_print(cmd, "Error: Target is not a ti_pru instance");
+		return ERROR_FAIL;
+	}
+	return ti_pru_resume(target, 1, 0, 0, 0);
+}
+
+static int ti_pru_handle_halt_command(struct command_invocation *cmd)
+{
+	struct target *target = get_current_target(cmd->ctx);
+	if (strcmp(target_type_name(target), "ti_pru") != 0) {
+		command_print(cmd, "Error: Target is not a ti_pru instance");
+		return ERROR_FAIL;
+	}
+	return ti_pru_halt(target);
+}
+
 static const struct command_registration ti_pru_exec_command_handlers[] = {
 	{
 		.name = "dump_regs",
@@ -799,6 +820,20 @@ static const struct command_registration ti_pru_exec_command_handlers[] = {
 		.mode = COMMAND_EXEC,
 		.help = "Load binary firmware into PRU Instruction RAM (IRAM)",
 		.usage = "<filename> [type]",
+	},
+	{
+		.name = "resume",
+		.handler = ti_pru_handle_resume_command,
+		.mode = COMMAND_EXEC,
+		.help = "Resume PRU execution directly via MEM-AP",
+		.usage = "",
+	},
+	{
+		.name = "halt",
+		.handler = ti_pru_handle_halt_command,
+		.mode = COMMAND_EXEC,
+		.help = "Halt PRU execution directly via MEM-AP",
+		.usage = "",
 	},
 	COMMAND_REGISTRATION_DONE
 };
