@@ -110,6 +110,7 @@ static struct target_type *target_types[] = {
 	&riscv_target,
 	&stm8_target,
 	&testee_target,
+	&ti_pru_target,
 	&xscale_target,
 	&xtensa_chip_target,
 };

@@ -83,7 +83,8 @@ ARMV7_SRC = \
 	%D%/armv7a_mmu.c \
 	%D%/cortex_a.c \
 	%D%/ls1_sap.c \
-	%D%/mem_ap.c
+	%D%/mem_ap.c \
+	%D%/ti_pru.c
 
 ARMV8_SRC = \
 	%D%/armv8_dpm.c \
@@ -237,6 +238,7 @@ ARC_SRC = \
 	%D%/arc_jtag.h \
 	%D%/arc_mem.h \
 	%D%/rtt.h \
+	%D%/ti_pru.h \
 	%D%/oocd_capstone.h
 
 include %D%/openrisc/Makefile.am
