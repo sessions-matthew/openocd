@@ -143,6 +143,9 @@ static const struct reg_arch_type ti_pru_reg_arch_type = {
 	.set = ti_pru_set_core_reg,
 };
 
+static struct reg_data_type ti_pru_type_uint32 = { .type = REG_TYPE_UINT32, .id = "uint32" };
+static struct reg_data_type ti_pru_type_code_ptr = { .type = REG_TYPE_CODE_PTR, .id = "code_ptr" };
+
 static struct reg_cache *ti_pru_build_reg_cache(struct target *target)
 {
 	struct ti_pru_common *pru = target_to_pru(target);
@@ -181,9 +184,9 @@ static struct reg_cache *ti_pru_build_reg_cache(struct target *target)
 		reg_list[i].caller_save = false;
 
 		if (i == TI_PRU_PC)
-			reg_list[i].reg_data_type = &(struct reg_data_type){ .type = REG_TYPE_CODE_PTR };
+			reg_list[i].reg_data_type = &ti_pru_type_code_ptr;
 		else
-			reg_list[i].reg_data_type = &(struct reg_data_type){ .type = REG_TYPE_UINT32 };
+			reg_list[i].reg_data_type = &ti_pru_type_uint32;
 	}
 
 	pru->core_cache = cache;
@@ -338,6 +341,44 @@ static void ti_pru_deinit_target(struct target *target)
 	free(target->private_config);
 }
 
+static void ti_pru_ensure_clocks(struct ti_pru_common *pru)
+{
+	if (!pru || !pru->ap)
+		return;
+
+	/* 1. De-assert PRU-ICSS local reset in PRM_PER (0x44E00C00) */
+	uint32_t rstctrl = 0;
+	if (mem_ap_read_u32(pru->ap, 0x44E00C00, &rstctrl) == ERROR_OK) {
+		rstctrl &= ~(1 << 1); /* Clear PRU_ICSS_LRST */
+		mem_ap_write_u32(pru->ap, 0x44E00C00, rstctrl);
+	}
+
+	/* 2. Select L3F 200 MHz clock in CM_DPLL (0x44E00530) */
+	mem_ap_write_u32(pru->ap, 0x44E00530, 0x00);
+
+	/* 3. Wake up PRU-ICSS clock domain (0x44E00140 = SW_WKUP) */
+	mem_ap_write_u32(pru->ap, 0x44E00140, 0x02);
+
+	/* 4. Enable PRU-ICSS module clock (0x44E000E8 = MODULEMODE_ENABLE) */
+	mem_ap_write_u32(pru->ap, 0x44E000E8, 0x02);
+
+	/* 5. Enable GPIO1 module clock (0x44E000AC = MODULEMODE_ENABLE) */
+	mem_ap_write_u32(pru->ap, 0x44E000AC, 0x02);
+
+	/* 6. Wait for PRU-ICSS module to transition out of disabled state */
+	for (int i = 0; i < 100; i++) {
+		uint32_t clkctrl = 0;
+		if (mem_ap_read_u32(pru->ap, 0x44E000E8, &clkctrl) == ERROR_OK) {
+			if ((clkctrl & 0x00030000) != 0x00030000 && (clkctrl & 0x03) == 0x02)
+				break;
+		}
+		alive_sleep(1);
+	}
+
+	/* 7. Configure PRU-ICSS CFG SYSCFG (0x4A326004): NO-IDLE, NO-STANDBY, STANDBY_INIT=0 */
+	mem_ap_write_u32(pru->ap, 0x4A326004, 0x05);
+}
+
 static int ti_pru_examine(struct target *target)
 {
 	struct ti_pru_common *pru = target_to_pru(target);
@@ -350,6 +391,9 @@ static int ti_pru_examine(struct target *target)
 				return ERROR_FAIL;
 			}
 		}
+
+		/* Ensure PRU-ICSS clocks and power are active before accessing registers */
+		ti_pru_ensure_clocks(pru);
 
 		uint32_t ctrl = 0;
 		int retval = ti_pru_read_u32(pru, pru->base_addr + PRU_REG_CTRL, &ctrl);
@@ -701,6 +745,9 @@ COMMAND_HANDLER(ti_pru_handle_load_command)
 	retval = image_open(&image, CMD_ARGV[0], (CMD_ARGC >= 2) ? CMD_ARGV[1] : NULL);
 	if (retval != ERROR_OK)
 		return retval;
+
+	/* Ensure PRU clocks and power domain are active */
+	ti_pru_ensure_clocks(pru);
 
 	/* Halt PRU before loading firmware */
 	ti_pru_halt(target);
