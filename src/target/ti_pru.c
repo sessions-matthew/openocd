@@ -786,6 +786,24 @@ static int ti_pru_deassert_reset(struct target *target)
 	return ERROR_OK;
 }
 
+static bool ti_pru_is_valid_address(target_addr_t address)
+{
+	/* PRU IRAM (0x0 - 0x1FFF) */
+	if (address < AM335X_PRU_IRAM_SIZE)
+		return true;
+	/* PRU-ICSS Subsystem space (0x4A300000 - 0x4A37FFFF) */
+	if (address >= 0x4A300000 && address < 0x4A380000)
+		return true;
+	/* SOC Peripherals & Control Module (0x44E00000 - 0x4C000000) */
+	if (address >= 0x44E00000 && address < 0x4C000000)
+		return true;
+	/* DDR3 / OCM RAM (0x402F0000 - 0x40310000, 0x80000000 - 0x90000000) */
+	if ((address >= 0x402F0000 && address < 0x40310000) ||
+	    (address >= 0x80000000 && address < 0x90000000))
+		return true;
+	return false;
+}
+
 /* Memory Read/Write */
 static int ti_pru_read_memory(struct target *target, target_addr_t address,
 		uint32_t size, uint32_t count, uint8_t *buffer)
@@ -796,9 +814,19 @@ static int ti_pru_read_memory(struct target *target, target_addr_t address,
 	/* If reading from low addresses [0x0 .. 0x1FFF], route to PRU IRAM */
 	if (address < pru->iram_size) {
 		phys_addr = pru->iram_addr + address;
+	} else if (!ti_pru_is_valid_address(address)) {
+		/* Return 0 for unmapped addresses to avoid poisoning DAP bus */
+		memset(buffer, 0, size * count);
+		return ERROR_OK;
 	}
 
-	return mem_ap_read_buf(pru->ap, buffer, size, count, phys_addr);
+	int retval = mem_ap_read_buf(pru->ap, buffer, size, count, phys_addr);
+	if (retval != ERROR_OK) {
+		dap_dp_init(pru->dap);
+		memset(buffer, 0, size * count);
+		return ERROR_OK;
+	}
+	return ERROR_OK;
 }
 
 static int ti_pru_write_memory(struct target *target, target_addr_t address,
