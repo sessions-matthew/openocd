@@ -983,6 +983,24 @@ COMMAND_HANDLER(ti_pru_handle_load_command)
 		/* Reset Program Counter to 0 by pulsing reset */
 		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, 0);
 		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, PRU_CTRL_SOFT_RST_N);
+
+		/* Pre-initialize SEGGER RTT Control Block in Data RAM 0 so host RTT finds it immediately at launch */
+		if (pru->dram_addr != 0) {
+			uint8_t rtt_cb[48] = {0};
+			memcpy(rtt_cb, "SEGGER RTT\0\0\0\0\0\0", 16);
+			target_buffer_set_u32(target, rtt_cb + 16, 1); /* MaxNumUpBuffers = 1 */
+			target_buffer_set_u32(target, rtt_cb + 20, 0); /* MaxNumDownBuffers = 0 */
+			target_buffer_set_u32(target, rtt_cb + 24, (uint32_t)(pru->dram_addr + 0x40)); /* sName = "Terminal" */
+			target_buffer_set_u32(target, rtt_cb + 28, (uint32_t)(pru->dram_addr + 0x100)); /* pBuffer */
+			target_buffer_set_u32(target, rtt_cb + 32, 256); /* SizeOfBuffer = 256 */
+			target_buffer_set_u32(target, rtt_cb + 36, 0);   /* WrOff = 0 */
+			target_buffer_set_u32(target, rtt_cb + 40, 0);   /* RdOff = 0 */
+			target_buffer_set_u32(target, rtt_cb + 44, 0);   /* Flags = 0 */
+			mem_ap_write_buf(pru->ap, rtt_cb, 1, sizeof(rtt_cb), pru->dram_addr);
+
+			char term_name[16] = "Terminal";
+			mem_ap_write_buf(pru->ap, (uint8_t *)term_name, 1, sizeof(term_name), pru->dram_addr + 0x40);
+		}
 	}
 
 	return retval;
