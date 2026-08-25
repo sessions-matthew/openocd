@@ -3029,16 +3029,12 @@ static int cortex_a_examine_first(struct target *target)
 				dap_put_ap(ahb_ap);
 				LOG_TARGET_DEBUG(target, "Non-intrusive RTT: AHB/AXI AP init failed, falling back to halt-based RTT");
 			}
-		} else if (armv7a->debug_ap && armv7a->debug_ap->ap_num != 0) {
-			ahb_ap = dap_get_ap(swjdp, 0);
-			if (ahb_ap) {
-				if (mem_ap_init(ahb_ap) == ERROR_OK) {
-					armv7a->system_ap = ahb_ap;
-					LOG_TARGET_DEBUG(target, "Non-intrusive RTT: System MEM-AP#0 found");
-				} else {
-					dap_put_ap(ahb_ap);
-				}
-			}
+		} else if (armv7a->debug_ap) {
+			/* On SoCs like AM335x, AP#0 is the system bus MEM-AP used for direct memory access */
+			armv7a->system_ap = dap_get_ap(swjdp, armv7a->debug_ap->ap_num);
+			if (armv7a->system_ap)
+				LOG_TARGET_DEBUG(target, "Non-intrusive RTT: Using MEM-AP #%" PRIu64 " for direct memory access",
+					armv7a->system_ap->ap_num);
 		}
 	}
 
@@ -3293,7 +3289,8 @@ static int cortex_a_rtt_find_cb(struct target *target, target_addr_t *address,
 	const size_t id_len = strlen(id);
 
 	*found = false;
-	LOG_INFO("rtt(ni): Searching for control block '%s'", id);
+	LOG_DEBUG("rtt(ni): Searching for control block '%s' from 0x%" TARGET_PRIxADDR " (size 0x%zx)",
+		id, *address, size);
 
 	for (target_addr_t addr = *address; addr < address_end; addr += sizeof(buf)) {
 		const size_t buf_size = MIN(sizeof(buf), (size_t)(address_end - addr));
@@ -3308,6 +3305,8 @@ static int cortex_a_rtt_find_cb(struct target *target, target_addr_t *address,
 			if (id_matched == id_len) {
 				*address = addr + off + 1 - id_len;
 				*found = true;
+				LOG_INFO("rtt(ni): Control block '%s' found at 0x%" TARGET_PRIxADDR,
+					id, *address);
 				return ERROR_OK;
 			}
 		}
@@ -3521,20 +3520,14 @@ int cortex_a_register_rtt_nonintrusive(struct target *target)
 				armv7a->system_ap = ahb_ap;
 			else
 				dap_put_ap(ahb_ap);
-		} else if (armv7a->debug_ap && armv7a->debug_ap->ap_num != 0) {
-			ahb_ap = dap_get_ap(swjdp, 0);
-			if (ahb_ap) {
-				if (mem_ap_init(ahb_ap) == ERROR_OK)
-					armv7a->system_ap = ahb_ap;
-				else
-					dap_put_ap(ahb_ap);
-			}
+		} else if (armv7a->debug_ap) {
+			armv7a->system_ap = dap_get_ap(swjdp, armv7a->debug_ap->ap_num);
 		}
 	}
 
 	if (!armv7a->system_ap) {
 		LOG_TARGET_WARNING(target,
-			"Non-intrusive RTT requested but no AHB/AXI AP was found. "
+			"Non-intrusive RTT requested but no MEM-AP was found. "
 			"RTT will fall back to halt-based access.");
 		/* Fall back: let the caller register the standard source instead */
 		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
