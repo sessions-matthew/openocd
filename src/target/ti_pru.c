@@ -632,7 +632,8 @@ static int ti_pru_step(struct target *target, bool current,
 		return ERROR_TARGET_NOT_HALTED;
 	}
 
-	if (!current) {
+	/* Only change PC if an explicit non-zero address was requested */
+	if (!current && address != 0) {
 		uint32_t word_pc = (address / 4) & 0xFFFF;
 		uint32_t ctrl_val = (word_pc << PRU_CTRL_PCTR_RST_VAL_SHIFT);
 		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl_val);
@@ -677,6 +678,9 @@ static int ti_pru_step(struct target *target, bool current,
 	target->state = TARGET_HALTED;
 	target->debug_reason = DBG_REASON_SINGLESTEP;
 
+	/* Invalidate register cache so GDB reads new registers */
+	register_cache_invalidate(pru->core_cache);
+
 	/* Update PC and notify callbacks */
 	uint32_t sts = 0;
 	ti_pru_read_u32(pru, pru->base_addr + PRU_REG_STS, &sts);
@@ -703,7 +707,7 @@ static int ti_pru_resume(struct target *target, bool current,
 		return ERROR_TARGET_NOT_HALTED;
 	}
 
-	if (!current) {
+	if (!current && address != 0) {
 		/* Set starting PC address by pulsing reset */
 		uint32_t word_pc = (address / 4) & 0xFFFF;
 		uint32_t ctrl_val = (word_pc << PRU_CTRL_PCTR_RST_VAL_SHIFT);
@@ -742,6 +746,8 @@ static int ti_pru_resume(struct target *target, bool current,
 
 	target->state = TARGET_RUNNING;
 	target->debug_reason = DBG_REASON_NOTHALTED;
+	register_cache_invalidate(pru->core_cache);
+
 	if (!target->gdb_port_override || strcmp(target->gdb_port_override, "disabled") != 0)
 		target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
 
