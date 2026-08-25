@@ -3263,7 +3263,10 @@ static int cortex_a_ni_read_buf(struct target *target, target_addr_t addr,
 	struct armv7a_common *armv7a = target_to_armv7a(target);
 	if (!armv7a->system_ap)
 		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
-	return mem_ap_read_buf(armv7a->system_ap, buf, size, count, addr);
+	int ret = mem_ap_read_buf(armv7a->system_ap, buf, size, count, addr);
+	if (ret != ERROR_OK)
+		return ret;
+	return dap_run(armv7a->arm.dap);
 }
 
 /* Helper: write bytes via AHB-AP without halting the CPU. */
@@ -3273,7 +3276,10 @@ static int cortex_a_ni_write_buf(struct target *target, target_addr_t addr,
 	struct armv7a_common *armv7a = target_to_armv7a(target);
 	if (!armv7a->system_ap)
 		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
-	return mem_ap_write_buf(armv7a->system_ap, buf, size, count, addr);
+	int ret = mem_ap_write_buf(armv7a->system_ap, buf, size, count, addr);
+	if (ret != ERROR_OK)
+		return ret;
+	return dap_run(armv7a->arm.dap);
 }
 
 static int cortex_a_rtt_find_cb(struct target *target, target_addr_t *address,
