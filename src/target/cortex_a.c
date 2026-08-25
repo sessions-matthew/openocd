@@ -3018,7 +3018,9 @@ static int cortex_a_examine_first(struct target *target)
 		struct adiv5_ap *ahb_ap = NULL;
 		if (dap_find_get_ap(swjdp, AP_TYPE_AHB3_AP, &ahb_ap) == ERROR_OK ||
 		    dap_find_get_ap(swjdp, AP_TYPE_AHB5_AP, &ahb_ap) == ERROR_OK ||
-		    dap_find_get_ap(swjdp, AP_TYPE_AXI_AP,  &ahb_ap) == ERROR_OK) {
+		    dap_find_get_ap(swjdp, AP_TYPE_AXI_AP,  &ahb_ap) == ERROR_OK ||
+		    dap_find_get_ap(swjdp, AP_TYPE_AHB5H_AP, &ahb_ap) == ERROR_OK ||
+		    dap_find_get_ap(swjdp, AP_TYPE_AXI5_AP,  &ahb_ap) == ERROR_OK) {
 			if (mem_ap_init(ahb_ap) == ERROR_OK) {
 				armv7a->system_ap = ahb_ap;
 				LOG_TARGET_DEBUG(target, "Non-intrusive RTT: AHB/AXI AP found (AP#%" PRIu64 ")",
@@ -3027,8 +3029,16 @@ static int cortex_a_examine_first(struct target *target)
 				dap_put_ap(ahb_ap);
 				LOG_TARGET_DEBUG(target, "Non-intrusive RTT: AHB/AXI AP init failed, falling back to halt-based RTT");
 			}
-		} else {
-			LOG_TARGET_DEBUG(target, "Non-intrusive RTT: no AHB/AXI AP found, halt-based RTT only");
+		} else if (armv7a->debug_ap && armv7a->debug_ap->ap_num != 0) {
+			ahb_ap = dap_get_ap(swjdp, 0);
+			if (ahb_ap) {
+				if (mem_ap_init(ahb_ap) == ERROR_OK) {
+					armv7a->system_ap = ahb_ap;
+					LOG_TARGET_DEBUG(target, "Non-intrusive RTT: System MEM-AP#0 found");
+				} else {
+					dap_put_ap(ahb_ap);
+				}
+			}
 		}
 	}
 
@@ -3269,6 +3279,8 @@ static int cortex_a_ni_write_buf(struct target *target, target_addr_t addr,
 static int cortex_a_rtt_find_cb(struct target *target, target_addr_t *address,
 		size_t size, const char *id, bool *found, void *user_data)
 {
+	if (!size)
+		size = 0x100;
 	target_addr_t address_end = *address + size;
 	uint8_t buf[1024];
 	size_t id_matched = 0;
@@ -3492,9 +3504,32 @@ int cortex_a_register_rtt_nonintrusive(struct target *target)
 	struct armv7a_common *armv7a = target_to_armv7a(target);
 
 	if (!armv7a->system_ap) {
+		struct adiv5_dap *swjdp = armv7a->arm.dap;
+		struct adiv5_ap *ahb_ap = NULL;
+		if (dap_find_get_ap(swjdp, AP_TYPE_AHB3_AP, &ahb_ap) == ERROR_OK ||
+		    dap_find_get_ap(swjdp, AP_TYPE_AHB5_AP, &ahb_ap) == ERROR_OK ||
+		    dap_find_get_ap(swjdp, AP_TYPE_AXI_AP,  &ahb_ap) == ERROR_OK ||
+		    dap_find_get_ap(swjdp, AP_TYPE_AHB5H_AP, &ahb_ap) == ERROR_OK ||
+		    dap_find_get_ap(swjdp, AP_TYPE_AXI5_AP,  &ahb_ap) == ERROR_OK) {
+			if (mem_ap_init(ahb_ap) == ERROR_OK)
+				armv7a->system_ap = ahb_ap;
+			else
+				dap_put_ap(ahb_ap);
+		} else if (armv7a->debug_ap && armv7a->debug_ap->ap_num != 0) {
+			ahb_ap = dap_get_ap(swjdp, 0);
+			if (ahb_ap) {
+				if (mem_ap_init(ahb_ap) == ERROR_OK)
+					armv7a->system_ap = ahb_ap;
+				else
+					dap_put_ap(ahb_ap);
+			}
+		}
+	}
+
+	if (!armv7a->system_ap) {
 		LOG_TARGET_WARNING(target,
-			"Non-intrusive RTT requested but no AHB/AXI AP was found "
-			"during examine. RTT will fall back to halt-based access.");
+			"Non-intrusive RTT requested but no AHB/AXI AP was found. "
+			"RTT will fall back to halt-based access.");
 		/* Fall back: let the caller register the standard source instead */
 		return ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
 	}
