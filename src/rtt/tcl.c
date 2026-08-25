@@ -22,12 +22,9 @@ COMMAND_HANDLER(handle_rtt_setup_command)
 	struct rtt_source source;
 
 	const char *DEFAULT_ID = "SEGGER RTT";
-	const char *selected_id;
-	if (CMD_ARGC < 2 || CMD_ARGC > 3)
-		return ERROR_COMMAND_SYNTAX_ERROR;
-	if (CMD_ARGC == 2)
-		selected_id = DEFAULT_ID;
-	else
+	const char *selected_id = DEFAULT_ID;
+
+	if (CMD_ARGC >= 3 && strcmp(CMD_ARGV[2], "undefined") != 0 && strcmp(CMD_ARGV[2], "{undefined}") != 0)
 		selected_id = CMD_ARGV[2];
 
 	source.find_cb = &target_rtt_find_control_block;
@@ -38,11 +35,14 @@ COMMAND_HANDLER(handle_rtt_setup_command)
 	source.write = &target_rtt_write_callback;
 	source.read_channel_info = &target_rtt_read_channel_info;
 
-	target_addr_t address;
-	uint32_t size;
+	target_addr_t address = 0x4a300000;
+	uint32_t size = 0x2000;
 
-	COMMAND_PARSE_NUMBER(target_addr, CMD_ARGV[0], address);
-	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], size);
+	if (CMD_ARGC >= 1 && strcmp(CMD_ARGV[0], "undefined") != 0)
+		COMMAND_PARSE_NUMBER(target_addr, CMD_ARGV[0], address);
+
+	if (CMD_ARGC >= 2 && strcmp(CMD_ARGV[1], "undefined") != 0 && strcmp(CMD_ARGV[1], "{undefined}") != 0)
+		COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], size);
 
 	struct target *target = get_current_target(CMD_CTX);
 
@@ -71,19 +71,19 @@ COMMAND_HANDLER(handle_rtt_setup_command)
 COMMAND_HANDLER(handle_rtt_setup_ni_command)
 {
 	const char *DEFAULT_ID = "SEGGER RTT";
-	const char *selected_id;
-	if (CMD_ARGC < 2 || CMD_ARGC > 3)
-		return ERROR_COMMAND_SYNTAX_ERROR;
-	if (CMD_ARGC == 2)
-		selected_id = DEFAULT_ID;
-	else
+	const char *selected_id = DEFAULT_ID;
+
+	if (CMD_ARGC >= 3 && strcmp(CMD_ARGV[2], "undefined") != 0 && strcmp(CMD_ARGV[2], "{undefined}") != 0)
 		selected_id = CMD_ARGV[2];
 
-	target_addr_t address;
-	uint32_t size;
+	target_addr_t address = 0x4a300000;
+	uint32_t size = 0x2000;
 
-	COMMAND_PARSE_NUMBER(target_addr, CMD_ARGV[0], address);
-	COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], size);
+	if (CMD_ARGC >= 1 && strcmp(CMD_ARGV[0], "undefined") != 0)
+		COMMAND_PARSE_NUMBER(target_addr, CMD_ARGV[0], address);
+
+	if (CMD_ARGC >= 2 && strcmp(CMD_ARGV[1], "undefined") != 0 && strcmp(CMD_ARGV[1], "{undefined}") != 0)
+		COMMAND_PARSE_NUMBER(u32, CMD_ARGV[1], size);
 
 	struct target *target = get_current_target(CMD_CTX);
 
