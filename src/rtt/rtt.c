@@ -73,6 +73,21 @@ static int read_channel_callback(void *user_data)
 {
 	int ret;
 
+	if (!rtt.found_cb) {
+		target_addr_t addr = rtt.addr;
+		rtt.source.find_cb(rtt.target, &addr, rtt.size, rtt.id,
+			&rtt.found_cb, NULL);
+		if (!rtt.found_cb)
+			return ERROR_OK; /* Keep polling until RAM is initialized */
+
+		LOG_INFO("rtt: Control block found at 0x%" TARGET_PRIxADDR, addr);
+		rtt.ctrl.address = addr;
+		if (rtt.source.read_cb(rtt.target, rtt.ctrl.address, &rtt.ctrl, NULL) != ERROR_OK)
+			return ERROR_OK;
+		if (rtt.source.start(rtt.target, &rtt.ctrl, NULL) != ERROR_OK)
+			return ERROR_OK;
+	}
+
 	ret = rtt.source.read(rtt.target, &rtt.ctrl, rtt.sink_list,
 		rtt.sink_list_length, NULL);
 
@@ -140,20 +155,19 @@ int rtt_start(void)
 				addr);
 			rtt.ctrl.address = addr;
 		} else {
-			LOG_ERROR("rtt: No control block found");
-			return ERROR_FAIL;
+			LOG_INFO("rtt: Control block not yet found in RAM, background polling will bind once loaded");
 		}
 	}
 
-	ret = rtt.source.read_cb(rtt.target, rtt.ctrl.address, &rtt.ctrl, NULL);
+	if (rtt.found_cb) {
+		ret = rtt.source.read_cb(rtt.target, rtt.ctrl.address, &rtt.ctrl, NULL);
+		if (ret != ERROR_OK)
+			return ret;
 
-	if (ret != ERROR_OK)
-		return ret;
-
-	ret = rtt.source.start(rtt.target, &rtt.ctrl, NULL);
-
-	if (ret != ERROR_OK)
-		return ret;
+		ret = rtt.source.start(rtt.target, &rtt.ctrl, NULL);
+		if (ret != ERROR_OK)
+			return ret;
+	}
 
 	target_register_timer_callback(&read_channel_callback,
 		rtt.polling_interval, 1, NULL);
