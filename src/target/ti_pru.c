@@ -251,7 +251,7 @@ enum ti_pru_cfg_param {
 	CFG_DRAM_ADDR,
 };
 
-static const struct nvp nvp_pru_config_opts[] = {
+static const struct jim_nvp nvp_pru_config_opts[] = {
 	{ .name = "-base-addr", .value = CFG_BASE_ADDR },
 	{ .name = "-iram-addr", .value = CFG_IRAM_ADDR },
 	{ .name = "-dram-addr", .value = CFG_DRAM_ADDR },
@@ -261,7 +261,7 @@ static const struct nvp nvp_pru_config_opts[] = {
 static int ti_pru_jim_configure(struct target *target, struct jim_getopt_info *goi)
 {
 	struct ti_pru_private_config *pc;
-	const struct nvp *n;
+	struct jim_nvp *n;
 	int e;
 
 	pc = (struct ti_pru_private_config *)target->private_config;
