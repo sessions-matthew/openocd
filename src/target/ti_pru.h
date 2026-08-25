@@ -57,48 +57,58 @@
 /* PRU Opcode for Software Breakpoint (HALT instruction) */
 #define PRU_OPCODE_HALT             0x2A000000
 
-/* Register indexes for GDB */
+/* Register indexes for GDB (aligned with standard ARM GDB core + PRU extension) */
 enum ti_pru_reg_index {
 	TI_PRU_R0 = 0,
-	TI_PRU_R1,
-	TI_PRU_R2,
-	TI_PRU_R3,
-	TI_PRU_R4,
-	TI_PRU_R5,
-	TI_PRU_R6,
-	TI_PRU_R7,
-	TI_PRU_R8,
-	TI_PRU_R9,
-	TI_PRU_R10,
-	TI_PRU_R11,
-	TI_PRU_R12,
-	TI_PRU_R13,
-	TI_PRU_R14,
-	TI_PRU_R15,
-	TI_PRU_R16,
-	TI_PRU_R17,
-	TI_PRU_R18,
-	TI_PRU_R19,
-	TI_PRU_R20,
-	TI_PRU_R21,
-	TI_PRU_R22,
-	TI_PRU_R23,
-	TI_PRU_R24,
-	TI_PRU_R25,
-	TI_PRU_R26,
-	TI_PRU_R27,
-	TI_PRU_R28,
-	TI_PRU_R29,
-	TI_PRU_R30,
-	TI_PRU_R31,
-	TI_PRU_PC,
-	TI_PRU_CYCLES,
-	TI_PRU_STATUS,
-	TI_PRU_NUM_REGS
+	TI_PRU_R1 = 1,
+	TI_PRU_R2 = 2,
+	TI_PRU_R3 = 3,
+	TI_PRU_R4 = 4,
+	TI_PRU_R5 = 5,
+	TI_PRU_R6 = 6,
+	TI_PRU_R7 = 7,
+	TI_PRU_R8 = 8,
+	TI_PRU_R9 = 9,
+	TI_PRU_R10 = 10,
+	TI_PRU_R11 = 11,
+	TI_PRU_R12 = 12,
+	TI_PRU_SP = 13,     /* PRU R13 (Stack Pointer) */
+	TI_PRU_LR = 14,     /* PRU R14 (Link Register) */
+	TI_PRU_PC = 15,     /* PRU PC */
+	TI_PRU_F0 = 16,
+	TI_PRU_F1 = 17,
+	TI_PRU_F2 = 18,
+	TI_PRU_F3 = 19,
+	TI_PRU_F4 = 20,
+	TI_PRU_F5 = 21,
+	TI_PRU_F6 = 22,
+	TI_PRU_F7 = 23,
+	TI_PRU_FPS = 24,
+	TI_PRU_CPSR = 25,   /* PRU CTRL / Runstate */
+	TI_PRU_R15 = 26,    /* PRU R15 */
+	TI_PRU_R16 = 27,
+	TI_PRU_R17 = 28,
+	TI_PRU_R18 = 29,
+	TI_PRU_R19 = 30,
+	TI_PRU_R20 = 31,
+	TI_PRU_R21 = 32,
+	TI_PRU_R22 = 33,
+	TI_PRU_R23 = 34,
+	TI_PRU_R24 = 35,
+	TI_PRU_R25 = 36,
+	TI_PRU_R26 = 37,
+	TI_PRU_R27 = 38,
+	TI_PRU_R28 = 39,
+	TI_PRU_R29 = 40,
+	TI_PRU_R30 = 41,    /* PRU GPIO OUT */
+	TI_PRU_R31 = 42,    /* PRU GPI / INT */
+	TI_PRU_CYCLES = 43,
+	TI_PRU_STATUS = 44,
+	TI_PRU_NUM_REGS = 45
 };
 
 #define TI_PRU_NUM_GP_REGS          32
-#define TI_PRU_NUM_GDB_REGS         33  /* R0-R31 + PC */
+#define TI_PRU_NUM_GDB_REGS         45
 
 struct ti_pru_reg {
 	uint32_t num;

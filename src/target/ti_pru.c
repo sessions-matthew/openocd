@@ -23,10 +23,12 @@
 
 static const char *const ti_pru_reg_names[TI_PRU_NUM_REGS] = {
 	"r0", "r1", "r2", "r3", "r4", "r5", "r6", "r7",
-	"r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
-	"r16", "r17", "r18", "r19", "r20", "r21", "r22", "r23",
-	"r24", "r25", "r26", "r27", "r28", "r29", "r30", "r31",
-	"pc", "cycles", "status"
+	"r8", "r9", "r10", "r11", "r12", "sp", "lr", "pc",
+	"f0", "f1", "f2", "f3", "f4", "f5", "f6", "f7",
+	"fps", "cpsr",
+	"r15", "r16", "r17", "r18", "r19", "r20", "r21", "r22",
+	"r23", "r24", "r25", "r26", "r27", "r28", "r29", "r30", "r31",
+	"cycles", "status"
 };
 
 /* Forward declarations */
@@ -59,21 +61,39 @@ static int ti_pru_get_core_reg(struct reg *reg)
 	struct target *target = pru_reg->target;
 	struct ti_pru_common *pru = target_to_pru(target);
 	uint32_t val = 0;
-	int retval;
+	int retval = ERROR_OK;
 
 	if (target->state != TARGET_HALTED) {
 		LOG_TARGET_WARNING(target, "Target not halted, register read may be stale");
 	}
 
-	if (pru_reg->num < TI_PRU_NUM_GP_REGS) {
-		/* General purpose registers R0-R31 use cached values on AM335x */
-		val = pru_reg->value;
-		retval = ERROR_OK;
+	if (pru_reg->num <= TI_PRU_R12) {
+		/* R0-R12: debug register block (0x4A322400 + num * 4) */
+		target_addr_t reg_addr = pru->base_addr + PRU_DEBUG_GPREG_BASE + (pru_reg->num * 4);
+		retval = ti_pru_read_u32(pru, reg_addr, &val);
+	} else if (pru_reg->num == TI_PRU_SP) {
+		/* SP = PRU R13 */
+		target_addr_t reg_addr = pru->base_addr + PRU_DEBUG_GPREG_BASE + (13 * 4);
+		retval = ti_pru_read_u32(pru, reg_addr, &val);
+	} else if (pru_reg->num == TI_PRU_LR) {
+		/* LR = PRU R14 */
+		target_addr_t reg_addr = pru->base_addr + PRU_DEBUG_GPREG_BASE + (14 * 4);
+		retval = ti_pru_read_u32(pru, reg_addr, &val);
 	} else if (pru_reg->num == TI_PRU_PC) {
 		/* Program Counter: STS register bits 15:0 = PCTR (word address) */
 		retval = ti_pru_read_u32(pru, pru->base_addr + PRU_REG_STS, &val);
 		if (retval == ERROR_OK)
 			val = (val & 0xFFFF) * 4;  /* Convert instruction word offset to byte address */
+	} else if (pru_reg->num >= TI_PRU_F0 && pru_reg->num <= TI_PRU_FPS) {
+		val = 0;
+	} else if (pru_reg->num == TI_PRU_CPSR) {
+		/* CPSR = PRU CTRL */
+		retval = ti_pru_read_u32(pru, pru->base_addr + PRU_REG_CTRL, &val);
+	} else if (pru_reg->num >= TI_PRU_R15 && pru_reg->num <= TI_PRU_R31) {
+		/* R15-R31: debug register block */
+		int hw_gp = (pru_reg->num - TI_PRU_R15) + 15;
+		target_addr_t reg_addr = pru->base_addr + PRU_DEBUG_GPREG_BASE + (hw_gp * 4);
+		retval = ti_pru_read_u32(pru, reg_addr, &val);
 	} else if (pru_reg->num == TI_PRU_CYCLES) {
 		retval = ti_pru_read_u32(pru, pru->base_addr + PRU_REG_CYCLE, &val);
 	} else if (pru_reg->num == TI_PRU_STATUS) {
@@ -99,26 +119,41 @@ static int ti_pru_set_core_reg(struct reg *reg, uint8_t *buf)
 	struct target *target = pru_reg->target;
 	struct ti_pru_common *pru = target_to_pru(target);
 	uint32_t val = buf_get_u32(buf, 0, 32);
-	int retval;
+	int retval = ERROR_OK;
 
 	if (target->state != TARGET_HALTED) {
 		LOG_TARGET_ERROR(target, "Target must be halted to write registers");
 		return ERROR_TARGET_NOT_HALTED;
 	}
 
-	if (pru_reg->num < TI_PRU_NUM_GP_REGS) {
+	if (pru_reg->num <= TI_PRU_R12) {
 		target_addr_t reg_addr = pru->base_addr + PRU_DEBUG_GPREG_BASE + (pru_reg->num * 4);
 		retval = ti_pru_write_u32(pru, reg_addr, val);
+	} else if (pru_reg->num == TI_PRU_SP) {
+		target_addr_t reg_addr = pru->base_addr + PRU_DEBUG_GPREG_BASE + (13 * 4);
+		retval = ti_pru_write_u32(pru, reg_addr, val);
+	} else if (pru_reg->num == TI_PRU_LR) {
+		target_addr_t reg_addr = pru->base_addr + PRU_DEBUG_GPREG_BASE + (14 * 4);
+		retval = ti_pru_write_u32(pru, reg_addr, val);
 	} else if (pru_reg->num == TI_PRU_PC) {
-		/* Set PCTR reset value in CTRL register (bits 31:16) */
-		uint32_t ctrl_val = 0;
-		retval = ti_pru_read_u32(pru, pru->base_addr + PRU_REG_CTRL, &ctrl_val);
+		/* Set PC by pulsing SOFT_RST_N with new PCTR_RST_VAL */
+		uint32_t word_pc = (val / 4) & 0xFFFF;
+		uint32_t ctrl_val = (word_pc << PRU_CTRL_PCTR_RST_VAL_SHIFT);
+		/* 1. Assert reset with new PC */
+		retval = ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl_val);
 		if (retval == ERROR_OK) {
-			uint32_t word_pc = (val / 4) & 0xFFFF;
-			ctrl_val = (ctrl_val & ~PRU_CTRL_PCTR_RST_VAL_MASK) |
-				(word_pc << PRU_CTRL_PCTR_RST_VAL_SHIFT);
+			/* 2. De-assert reset keeping new PC */
+			ctrl_val |= PRU_CTRL_SOFT_RST_N;
 			retval = ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl_val);
 		}
+	} else if (pru_reg->num >= TI_PRU_F0 && pru_reg->num <= TI_PRU_FPS) {
+		retval = ERROR_OK;
+	} else if (pru_reg->num == TI_PRU_CPSR) {
+		retval = ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, val);
+	} else if (pru_reg->num >= TI_PRU_R15 && pru_reg->num <= TI_PRU_R31) {
+		int hw_gp = (pru_reg->num - TI_PRU_R15) + 15;
+		target_addr_t reg_addr = pru->base_addr + PRU_DEBUG_GPREG_BASE + (hw_gp * 4);
+		retval = ti_pru_write_u32(pru, reg_addr, val);
 	} else if (pru_reg->num == TI_PRU_CYCLES) {
 		retval = ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CYCLE, val);
 	} else if (pru_reg->num == TI_PRU_STATUS) {
@@ -151,16 +186,19 @@ static struct reg_cache *ti_pru_build_reg_cache(struct target *target)
 	struct ti_pru_common *pru = target_to_pru(target);
 	struct reg_cache *cache = malloc(sizeof(struct reg_cache));
 	struct reg *reg_list = calloc(TI_PRU_NUM_REGS, sizeof(struct reg));
-	struct reg_feature *feature = malloc(sizeof(struct reg_feature));
+	struct reg_feature *feature_core = malloc(sizeof(struct reg_feature));
+	struct reg_feature *feature_ctrl = malloc(sizeof(struct reg_feature));
 
-	if (!cache || !reg_list || !feature) {
+	if (!cache || !reg_list || !feature_core || !feature_ctrl) {
 		free(cache);
 		free(reg_list);
-		free(feature);
+		free(feature_core);
+		free(feature_ctrl);
 		return NULL;
 	}
 
-	feature->name = "org.gnu.gdb.pru.core";
+	feature_core->name = "org.gnu.gdb.arm.core";
+	feature_ctrl->name = "org.gnu.gdb.pru.regs";
 	cache->name = "TI PRU Registers";
 	cache->next = NULL;
 	cache->reg_list = reg_list;
@@ -180,10 +218,15 @@ static struct reg_cache *ti_pru_build_reg_cache(struct target *target)
 		reg_list[i].valid = false;
 		reg_list[i].type = &ti_pru_reg_arch_type;
 		reg_list[i].arch_info = &pru->core_regs[i];
-		reg_list[i].feature = feature;
 		reg_list[i].caller_save = false;
 
-		if (i == TI_PRU_PC)
+		if (i <= TI_PRU_CPSR) {
+			reg_list[i].feature = feature_core;
+		} else {
+			reg_list[i].feature = feature_ctrl;
+		}
+
+		if (i == TI_PRU_PC || i == TI_PRU_LR)
 			reg_list[i].reg_data_type = &ti_pru_type_code_ptr;
 		else
 			reg_list[i].reg_data_type = &ti_pru_type_uint32;
@@ -452,14 +495,25 @@ static int ti_pru_poll(struct target *target)
 	} else {
 		if (target->state != TARGET_HALTED) {
 			target->state = TARGET_HALTED;
-			target->debug_reason = DBG_REASON_DBGRQ;
 
 			/* Refresh PC */
 			uint32_t sts = 0;
 			ti_pru_read_u32(pru, pru->base_addr + PRU_REG_STS, &sts);
 			uint32_t pc = (sts & 0xFFFF) * 4;
 
-			LOG_TARGET_DEBUG(target, "PRU halted at PC=0x%08" PRIx32 " (CTRL=0x%08" PRIx32 ")", pc, ctrl);
+			/* Check if a breakpoint exists at this PC or previous PC */
+			struct breakpoint *bkpt = breakpoint_find(target, pc);
+			if (!bkpt && pc >= 4)
+				bkpt = breakpoint_find(target, pc - 4);
+
+			if (bkpt) {
+				target->debug_reason = DBG_REASON_BREAKPOINT;
+			} else {
+				target->debug_reason = DBG_REASON_DBGRQ;
+			}
+
+			LOG_TARGET_DEBUG(target, "PRU halted at PC=0x%08" PRIx32 " (CTRL=0x%08" PRIx32 ", reason=%d)",
+				pc, ctrl, target->debug_reason);
 			if (!target->gdb_port_override || strcmp(target->gdb_port_override, "disabled") != 0)
 				target_call_event_callbacks(target, TARGET_EVENT_HALTED);
 		}
@@ -526,39 +580,42 @@ static int ti_pru_halt(struct target *target)
 	return ERROR_OK;
 }
 
-static int ti_pru_resume(struct target *target, bool current,
-		target_addr_t address, bool handle_breakpoints, bool debug_execution)
+static int ti_pru_add_breakpoint(struct target *target, struct breakpoint *breakpoint)
 {
 	struct ti_pru_common *pru = target_to_pru(target);
-	uint32_t ctrl = 0;
-	int retval;
 
-	LOG_TARGET_DEBUG(target, "%s: current=%d, address=0x%08" TARGET_PRIxADDR, __func__, current, address);
-
-	if (target->state != TARGET_HALTED) {
-		LOG_TARGET_WARNING(target, "Target not halted");
-		return ERROR_TARGET_NOT_HALTED;
-	}
-
-	if (!current) {
-		/* Set starting PC address */
-		uint32_t word_pc = (address / 4) & 0xFFFF;
-		ctrl = (word_pc << PRU_CTRL_PCTR_RST_VAL_SHIFT) | PRU_CTRL_SOFT_RST_N;
-		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl);
-	}
-
-	/* Start core: ENABLE | CTR_EN | SOFT_RST_N (0x0000000B) */
-	ctrl = PRU_CTRL_CTR_EN | PRU_CTRL_ENABLE | PRU_CTRL_SOFT_RST_N;
-	retval = ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl);
+	target_addr_t phys_addr = pru->iram_addr + (breakpoint->address % pru->iram_size);
+	uint32_t orig_ins = 0;
+	int retval = ti_pru_read_u32(pru, phys_addr, &orig_ins);
 	if (retval != ERROR_OK)
 		return retval;
 
-	target->state = TARGET_RUNNING;
-	target->debug_reason = DBG_REASON_NOTHALTED;
-	if (!target->gdb_port_override || strcmp(target->gdb_port_override, "disabled") != 0)
-		target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
+	if (!breakpoint->orig_instr) {
+		breakpoint->orig_instr = malloc(4);
+		if (!breakpoint->orig_instr)
+			return ERROR_FAIL;
+	}
+	buf_set_u32(breakpoint->orig_instr, 0, 32, orig_ins);
 
-	return ERROR_OK;
+	/* Write HALT opcode (0x2A000000) */
+	LOG_TARGET_DEBUG(target, "Set PRU breakpoint at 0x%08" TARGET_PRIxADDR " (orig=0x%08" PRIx32 ")",
+		breakpoint->address, orig_ins);
+	return ti_pru_write_u32(pru, phys_addr, PRU_OPCODE_HALT);
+}
+
+static int ti_pru_remove_breakpoint(struct target *target, struct breakpoint *breakpoint)
+{
+	struct ti_pru_common *pru = target_to_pru(target);
+
+	if (!breakpoint->orig_instr)
+		return ERROR_FAIL;
+
+	target_addr_t phys_addr = pru->iram_addr + (breakpoint->address % pru->iram_size);
+	uint32_t orig_ins = buf_get_u32(breakpoint->orig_instr, 0, 32);
+
+	LOG_TARGET_DEBUG(target, "Remove PRU breakpoint at 0x%08" TARGET_PRIxADDR " (restore=0x%08" PRIx32 ")",
+		breakpoint->address, orig_ins);
+	return ti_pru_write_u32(pru, phys_addr, orig_ins);
 }
 
 static int ti_pru_step(struct target *target, bool current,
@@ -577,12 +634,29 @@ static int ti_pru_step(struct target *target, bool current,
 
 	if (!current) {
 		uint32_t word_pc = (address / 4) & 0xFFFF;
-		ctrl = (word_pc << PRU_CTRL_PCTR_RST_VAL_SHIFT) | PRU_CTRL_SOFT_RST_N;
-		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl);
+		uint32_t ctrl_val = (word_pc << PRU_CTRL_PCTR_RST_VAL_SHIFT);
+		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl_val);
+		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl_val | PRU_CTRL_SOFT_RST_N);
 	}
 
-	/* Single step: SINGLE_STEP | CTR_EN | ENABLE | SOFT_RST_N (0x0000010B) */
-	ctrl = PRU_CTRL_SINGLE_STEP | PRU_CTRL_CTR_EN | PRU_CTRL_ENABLE | PRU_CTRL_SOFT_RST_N;
+	/* If stepping from a breakpoint location, temporarily restore original instruction */
+	struct breakpoint *breakpoint = NULL;
+	if (handle_breakpoints) {
+		uint32_t sts = 0;
+		ti_pru_read_u32(pru, pru->base_addr + PRU_REG_STS, &sts);
+		uint32_t pc = (sts & 0xFFFF) * 4;
+		breakpoint = breakpoint_find(target, pc);
+		if (breakpoint)
+			ti_pru_remove_breakpoint(target, breakpoint);
+	}
+
+	/* Read current CTRL to preserve PCTR_RST_VAL */
+	retval = ti_pru_read_u32(pru, pru->base_addr + PRU_REG_CTRL, &ctrl);
+	if (retval != ERROR_OK)
+		return retval;
+
+	/* Single step: SINGLE_STEP | CTR_EN | ENABLE | SOFT_RST_N */
+	ctrl |= PRU_CTRL_SINGLE_STEP | PRU_CTRL_CTR_EN | PRU_CTRL_ENABLE | PRU_CTRL_SOFT_RST_N;
 	retval = ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl);
 	if (retval != ERROR_OK)
 		return retval;
@@ -597,6 +671,9 @@ static int ti_pru_step(struct target *target, bool current,
 		timeout--;
 	}
 
+	if (breakpoint)
+		ti_pru_add_breakpoint(target, breakpoint);
+
 	target->state = TARGET_HALTED;
 	target->debug_reason = DBG_REASON_SINGLESTEP;
 
@@ -606,7 +683,68 @@ static int ti_pru_step(struct target *target, bool current,
 	uint32_t pc = (sts & 0xFFFF) * 4;
 	LOG_TARGET_DEBUG(target, "Single-step completed at PC=0x%08" PRIx32, pc);
 
-	target_call_event_callbacks(target, TARGET_EVENT_HALTED);
+	if (!target->gdb_port_override || strcmp(target->gdb_port_override, "disabled") != 0)
+		target_call_event_callbacks(target, TARGET_EVENT_HALTED);
+
+	return ERROR_OK;
+}
+
+static int ti_pru_resume(struct target *target, bool current,
+		target_addr_t address, bool handle_breakpoints, bool debug_execution)
+{
+	struct ti_pru_common *pru = target_to_pru(target);
+	uint32_t ctrl = 0;
+	int retval;
+
+	LOG_TARGET_DEBUG(target, "%s: current=%d, address=0x%08" TARGET_PRIxADDR, __func__, current, address);
+
+	if (target->state != TARGET_HALTED) {
+		LOG_TARGET_WARNING(target, "Target not halted");
+		return ERROR_TARGET_NOT_HALTED;
+	}
+
+	if (!current) {
+		/* Set starting PC address by pulsing reset */
+		uint32_t word_pc = (address / 4) & 0xFFFF;
+		uint32_t ctrl_val = (word_pc << PRU_CTRL_PCTR_RST_VAL_SHIFT);
+		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl_val);
+		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl_val | PRU_CTRL_SOFT_RST_N);
+	}
+
+	/* Step over breakpoint if current PC is at a breakpoint */
+	if (handle_breakpoints) {
+		uint32_t sts = 0;
+		ti_pru_read_u32(pru, pru->base_addr + PRU_REG_STS, &sts);
+		uint32_t pc = (sts & 0xFFFF) * 4;
+		struct breakpoint *breakpoint = breakpoint_find(target, pc);
+		if (breakpoint) {
+			LOG_TARGET_DEBUG(target, "Stepping over breakpoint at 0x%08" PRIx32, pc);
+			retval = ti_pru_step(target, true, 0, true);
+			if (retval != ERROR_OK)
+				return retval;
+		}
+	}
+
+	/* Ensure PRU clocks and external OCP master port are active */
+	ti_pru_ensure_clocks(pru);
+
+	/* Read current CTRL to preserve PCTR_RST_VAL */
+	retval = ti_pru_read_u32(pru, pru->base_addr + PRU_REG_CTRL, &ctrl);
+	if (retval != ERROR_OK)
+		return retval;
+
+	/* Start core: ENABLE | CTR_EN | SOFT_RST_N (clear SINGLE_STEP) */
+	ctrl &= ~PRU_CTRL_SINGLE_STEP;
+	ctrl |= PRU_CTRL_CTR_EN | PRU_CTRL_ENABLE | PRU_CTRL_SOFT_RST_N;
+	retval = ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl);
+	if (retval != ERROR_OK)
+		return retval;
+
+	target->state = TARGET_RUNNING;
+	target->debug_reason = DBG_REASON_NOTHALTED;
+	if (!target->gdb_port_override || strcmp(target->gdb_port_override, "disabled") != 0)
+		target_call_event_callbacks(target, TARGET_EVENT_RESUMED);
+
 	return ERROR_OK;
 }
 
@@ -699,7 +837,7 @@ static int ti_pru_get_gdb_reg_list(struct target *target, struct reg **reg_list[
 
 static const char *ti_pru_get_gdb_arch(const struct target *target)
 {
-	return "pru";
+	return "arm";
 }
 
 static struct target *get_pru_target(struct command_invocation *cmd)
@@ -917,6 +1055,9 @@ struct target_type ti_pru_target = {
 
 	.read_memory = ti_pru_read_memory,
 	.write_memory = ti_pru_write_memory,
+
+	.add_breakpoint = ti_pru_add_breakpoint,
+	.remove_breakpoint = ti_pru_remove_breakpoint,
 
 	.commands = ti_pru_command_handlers,
 };
