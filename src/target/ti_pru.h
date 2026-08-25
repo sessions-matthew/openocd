@@ -140,4 +140,6 @@ static inline struct ti_pru_common *target_to_pru(struct target *target)
 
 extern struct target_type ti_pru_target;
 
+int ti_pru_register_rtt_nonintrusive(struct target *target);
+
 #endif /* OPENOCD_TARGET_TI_PRU_H */

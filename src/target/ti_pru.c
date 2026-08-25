@@ -16,6 +16,7 @@
 #include "register.h"
 #include "breakpoints.h"
 #include "image.h"
+#include "rtt.h"
 #include <helper/log.h>
 #include <helper/binarybuffer.h>
 #include <helper/nvp.h>
@@ -1062,6 +1063,233 @@ static const struct command_registration ti_pru_exec_command_handlers[] = {
 	},
 	COMMAND_REGISTRATION_DONE
 };
+
+/* Non-Intrusive RTT Implementation for TI PRU */
+static int ti_pru_rtt_find_cb(struct target *target, target_addr_t *address,
+		size_t size, const char *id, bool *found, void *user_data)
+{
+	target_addr_t address_end = *address + size;
+	uint8_t buf[1024];
+	size_t id_matched = 0;
+	const size_t id_len = strlen(id);
+
+	*found = false;
+	LOG_INFO("rtt(pru): Searching for control block '%s' in 0x%08" TARGET_PRIxADDR "..0x%08" TARGET_PRIxADDR,
+		id, *address, address_end);
+
+	for (target_addr_t addr = *address; addr < address_end; addr += sizeof(buf)) {
+		const size_t buf_size = MIN(sizeof(buf), (size_t)(address_end - addr));
+		if (ti_pru_read_memory(target, addr, 1, buf_size, buf) != ERROR_OK)
+			return ERROR_FAIL;
+
+		for (size_t off = 0; off < buf_size; off++) {
+			if (id_matched > 0 && buf[off] != id[id_matched])
+				id_matched = 0;
+			if (buf[off] == id[id_matched])
+				id_matched++;
+			if (id_matched == id_len) {
+				*address = addr + off + 1 - id_len;
+				*found = true;
+				LOG_INFO("rtt(pru): Control block '%s' found at 0x%08" TARGET_PRIxADDR, id, *address);
+				return ERROR_OK;
+			}
+		}
+	}
+	return ERROR_OK;
+}
+
+static int ti_pru_rtt_read_cb(struct target *target, target_addr_t address,
+		struct rtt_control *ctrl, void *user_data)
+{
+	uint8_t buf[RTT_CB_SIZE];
+	if (ti_pru_read_memory(target, address, 1, RTT_CB_SIZE, buf) != ERROR_OK)
+		return ERROR_FAIL;
+	memcpy(ctrl->id, buf, RTT_CB_MAX_ID_LENGTH);
+	ctrl->id[RTT_CB_MAX_ID_LENGTH - 1] = '\0';
+	ctrl->num_up_channels   = target_buffer_get_u32(target, buf + RTT_CB_MAX_ID_LENGTH + 0);
+	ctrl->num_down_channels = target_buffer_get_u32(target, buf + RTT_CB_MAX_ID_LENGTH + 4);
+	return ERROR_OK;
+}
+
+static int ti_pru_rtt_start(struct target *target,
+		const struct rtt_control *ctrl, void *user_data)
+{
+	return ERROR_OK;
+}
+
+static int ti_pru_rtt_stop(struct target *target, void *user_data)
+{
+	return ERROR_OK;
+}
+
+static int ti_pru_rtt_read_channel_desc(struct target *target,
+		const struct rtt_control *ctrl, unsigned int idx,
+		enum rtt_channel_type type, struct rtt_channel *channel)
+{
+	const uint32_t ch_size = RTT_CHANNEL_SIZE_32;
+	target_addr_t base = ctrl->address + RTT_CB_SIZE;
+	uint32_t n_ch = (type == RTT_CHANNEL_TYPE_UP) ?
+		ctrl->num_up_channels : ctrl->num_down_channels;
+
+	if (type == RTT_CHANNEL_TYPE_DOWN)
+		base += (target_addr_t)ctrl->num_up_channels * ch_size;
+
+	if (idx >= n_ch)
+		return ERROR_COMMAND_ARGUMENT_INVALID;
+
+	target_addr_t ch_addr = base + (target_addr_t)idx * ch_size;
+	uint8_t buf[RTT_CHANNEL_SIZE_32];
+
+	if (ti_pru_read_memory(target, ch_addr, 1, RTT_CHANNEL_SIZE_32, buf) != ERROR_OK)
+		return ERROR_FAIL;
+
+	channel->address   = ch_addr;
+	channel->name_addr = target_buffer_get_u32(target, buf + 0);
+	channel->buffer_addr = target_buffer_get_u32(target, buf + 4);
+	channel->size      = target_buffer_get_u32(target, buf + 8);
+	channel->write_pos = target_buffer_get_u32(target, buf + 12);
+	channel->read_pos  = target_buffer_get_u32(target, buf + 16);
+	channel->flags     = target_buffer_get_u32(target, buf + 20);
+	return ERROR_OK;
+}
+
+static int ti_pru_rtt_read_channel_info(struct target *target,
+		const struct rtt_control *ctrl, unsigned int channel_index,
+		enum rtt_channel_type type, struct rtt_channel_info *info,
+		void *user_data)
+{
+	struct rtt_channel ch;
+	if (ti_pru_rtt_read_channel_desc(target, ctrl, channel_index, type, &ch) != ERROR_OK)
+		return ERROR_FAIL;
+
+	info->size  = ch.size;
+	info->flags = ch.flags;
+
+	if (!ch.size || !ch.name_addr)
+		return ERROR_OK;
+
+	return ti_pru_read_memory(target, ch.name_addr, 1,
+			(uint32_t)info->name_length - 1, (uint8_t *)info->name);
+}
+
+static int ti_pru_rtt_read(struct target *target,
+		const struct rtt_control *ctrl, struct rtt_sink_list **sinks,
+		size_t num_channels, void *user_data)
+{
+	size_t n = MIN(num_channels, (size_t)ctrl->num_up_channels);
+
+	for (size_t i = 0; i < n; i++) {
+		if (!sinks[i])
+			continue;
+
+		struct rtt_channel ch;
+		if (ti_pru_rtt_read_channel_desc(target, ctrl, i,
+				RTT_CHANNEL_TYPE_UP, &ch) != ERROR_OK)
+			return ERROR_FAIL;
+
+		if (!ch.size || !ch.buffer_addr || ch.read_pos == ch.write_pos)
+			continue;
+
+		uint8_t buf[1024];
+		uint32_t len;
+
+		if (ch.read_pos < ch.write_pos) {
+			len = MIN((uint32_t)sizeof(buf), ch.write_pos - ch.read_pos);
+			if (ti_pru_read_memory(target,
+					ch.buffer_addr + ch.read_pos, 1, len, buf) != ERROR_OK)
+				return ERROR_FAIL;
+		} else {
+			uint32_t first = MIN((uint32_t)sizeof(buf), ch.size - ch.read_pos);
+			if (ti_pru_read_memory(target,
+					ch.buffer_addr + ch.read_pos, 1, first, buf) != ERROR_OK)
+				return ERROR_FAIL;
+			uint32_t second = MIN((uint32_t)sizeof(buf) - first,
+					ch.write_pos);
+			if (second && ti_pru_read_memory(target,
+					ch.buffer_addr, 1, second, buf + first) != ERROR_OK)
+				return ERROR_FAIL;
+			len = first + second;
+		}
+
+		for (struct rtt_sink_list *s = sinks[i]; s; s = s->next)
+			s->read(i, buf, len, s->user_data);
+
+		uint8_t rp_buf[4];
+		target_buffer_set_u32(target, rp_buf,
+				(ch.read_pos + len) % ch.size);
+		ti_pru_write_memory(target,
+				ch.address + 16 /* read_pos offset */, 4, 1, rp_buf);
+	}
+	return ERROR_OK;
+}
+
+static int ti_pru_rtt_write(struct target *target,
+		struct rtt_control *ctrl, unsigned int channel_index,
+		const uint8_t *buffer, size_t *length, void *user_data)
+{
+	if (channel_index >= ctrl->num_down_channels)
+		return ERROR_OK;
+
+	struct rtt_channel ch;
+	if (ti_pru_rtt_read_channel_desc(target, ctrl, channel_index,
+			RTT_CHANNEL_TYPE_DOWN, &ch) != ERROR_OK)
+		return ERROR_FAIL;
+
+	if (!ch.size || !ch.buffer_addr) {
+		*length = 0;
+		return ERROR_OK;
+	}
+
+	uint32_t free_space = (ch.read_pos > ch.write_pos) ?
+		(ch.read_pos - ch.write_pos - 1) :
+		(ch.size - ch.write_pos + ch.read_pos - 1);
+
+	size_t to_write = MIN((size_t)free_space, *length);
+	if (!to_write) {
+		*length = 0;
+		return ERROR_OK;
+	}
+
+	if (ch.write_pos + to_write <= ch.size) {
+		if (ti_pru_write_memory(target,
+				ch.buffer_addr + ch.write_pos, 1, (uint32_t)to_write, buffer) != ERROR_OK)
+			return ERROR_FAIL;
+	} else {
+		uint32_t first = ch.size - ch.write_pos;
+		uint32_t second = (uint32_t)to_write - first;
+		if (ti_pru_write_memory(target,
+				ch.buffer_addr + ch.write_pos, 1, first, buffer) != ERROR_OK)
+			return ERROR_FAIL;
+		if (ti_pru_write_memory(target,
+				ch.buffer_addr, 1, second, buffer + first) != ERROR_OK)
+			return ERROR_FAIL;
+	}
+
+	uint8_t wp_buf[4];
+	target_buffer_set_u32(target, wp_buf,
+			(ch.write_pos + to_write) % ch.size);
+	ti_pru_write_memory(target,
+			ch.address + 12 /* write_pos offset */, 4, 1, wp_buf);
+
+	*length = to_write;
+	return ERROR_OK;
+}
+
+int ti_pru_register_rtt_nonintrusive(struct target *target)
+{
+	const struct rtt_source ni_src = {
+		.find_cb          = ti_pru_rtt_find_cb,
+		.read_cb          = ti_pru_rtt_read_cb,
+		.read_channel_info = ti_pru_rtt_read_channel_info,
+		.start            = ti_pru_rtt_start,
+		.stop             = ti_pru_rtt_stop,
+		.read             = ti_pru_rtt_read,
+		.write            = ti_pru_rtt_write,
+	};
+
+	LOG_TARGET_INFO(target, "Non-intrusive PRU RTT enabled via MEM-AP");
+	return rtt_register_source(ni_src, target);
+}
 
 static const struct command_registration ti_pru_command_handlers[] = {
 	{

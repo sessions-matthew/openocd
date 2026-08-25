@@ -11,6 +11,7 @@
 #include <helper/log.h>
 #include <target/rtt.h>
 #include <target/cortex_a.h>
+#include <target/ti_pru.h>
 
 #include "rtt.h"
 
@@ -45,17 +46,21 @@ COMMAND_HANDLER(handle_rtt_setup_command)
 
 	struct target *target = get_current_target(CMD_CTX);
 
-	/* For Cortex-A targets that expose an AHB/AXI system-bus AP, automatically
-	 * use the non-intrusive source so RTT polling never requires a CPU halt.
-	 * Falls back to the halt-based source if unavailable (non-Cortex-A, or no AHB-AP). */
-	int ret = cortex_a_register_rtt_nonintrusive(target);
+	/* For Cortex-A and TI PRU targets that expose an AHB/AXI system-bus AP,
+	 * automatically use the non-intrusive source so RTT polling never requires a CPU halt.
+	 * Falls back to the halt-based source if unavailable. */
+	int ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	if (target->type == &ti_pru_target)
+		ret = ti_pru_register_rtt_nonintrusive(target);
+	else if (target->type == &cortexa_target)
+		ret = cortex_a_register_rtt_nonintrusive(target);
+
 	if (ret == ERROR_TARGET_RESOURCE_NOT_AVAILABLE) {
-		/* No AHB-AP or not a Cortex-A target: use halt-based source */
+		/* No AHB-AP or non-accelerated target: use halt-based source */
 		rtt_register_source(source, target);
 	} else if (ret != ERROR_OK) {
 		return ret;
 	}
-	/* ret == ERROR_OK: NI source already registered by cortex_a_register_rtt_nonintrusive() */
 
 	if (rtt_setup(address, size, selected_id) != ERROR_OK)
 		return ERROR_FAIL;
@@ -82,11 +87,16 @@ COMMAND_HANDLER(handle_rtt_setup_ni_command)
 
 	struct target *target = get_current_target(CMD_CTX);
 
-	/* Try non-intrusive AHB-AP source first (Cortex-A only).
+	/* Try non-intrusive AHB/MEM-AP source first.
 	 * Falls back to the standard halt-based source if unavailable. */
-	int ret = cortex_a_register_rtt_nonintrusive(target);
+	int ret = ERROR_TARGET_RESOURCE_NOT_AVAILABLE;
+	if (target->type == &ti_pru_target)
+		ret = ti_pru_register_rtt_nonintrusive(target);
+	else if (target->type == &cortexa_target)
+		ret = cortex_a_register_rtt_nonintrusive(target);
+
 	if (ret == ERROR_TARGET_RESOURCE_NOT_AVAILABLE) {
-		/* Graceful fallback: no AHB-AP or not a Cortex-A — use halt-based */
+		/* Graceful fallback: no AHB-AP or unsupported core — use halt-based */
 		LOG_WARNING("rtt setup_ni: non-intrusive source unavailable, "
 			"falling back to halt-based RTT");
 		struct rtt_source source;
