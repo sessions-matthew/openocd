@@ -161,6 +161,9 @@ COMMAND_HANDLER(handle_rtt_start_command)
 	if (CMD_ARGC < 2 || CMD_ARGC > 3)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
+	/* If a service is already running on this port, remove it first to allow seamless rebind */
+	remove_service("rtt", CMD_ARGV[0]);
+
 	service = calloc(1, sizeof(struct rtt_service));
 
 	if (!service) {
