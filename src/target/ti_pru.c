@@ -42,14 +42,14 @@ static int ti_pru_read_u32(struct ti_pru_common *pru, target_addr_t addr, uint32
 {
 	if (!pru || !pru->ap)
 		return ERROR_FAIL;
-	return mem_ap_read_u32(pru->ap, addr, val);
+	return mem_ap_read_atomic_u32(pru->ap, addr, val);
 }
 
 static int ti_pru_write_u32(struct ti_pru_common *pru, target_addr_t addr, uint32_t val)
 {
 	if (!pru || !pru->ap)
 		return ERROR_FAIL;
-	return mem_ap_write_u32(pru->ap, addr, val);
+	return mem_ap_write_atomic_u32(pru->ap, addr, val);
 }
 
 /* Register get / set handlers */
@@ -351,27 +351,27 @@ static void ti_pru_ensure_clocks(struct ti_pru_common *pru)
 
 	/* 1. De-assert PRU-ICSS local reset in PRM_PER (0x44E00C00) */
 	uint32_t rstctrl = 0;
-	if (mem_ap_read_u32(pru->ap, 0x44E00C00, &rstctrl) == ERROR_OK) {
+	if (mem_ap_read_atomic_u32(pru->ap, 0x44E00C00, &rstctrl) == ERROR_OK) {
 		rstctrl &= ~(1 << 1); /* Clear PRU_ICSS_LRST */
-		mem_ap_write_u32(pru->ap, 0x44E00C00, rstctrl);
+		mem_ap_write_atomic_u32(pru->ap, 0x44E00C00, rstctrl);
 	}
 
 	/* 2. Select L3F 200 MHz clock in CM_DPLL (0x44E00530) */
-	mem_ap_write_u32(pru->ap, 0x44E00530, 0x00);
+	mem_ap_write_atomic_u32(pru->ap, 0x44E00530, 0x00);
 
 	/* 3. Wake up PRU-ICSS clock domain (0x44E00140 = SW_WKUP) */
-	mem_ap_write_u32(pru->ap, 0x44E00140, 0x02);
+	mem_ap_write_atomic_u32(pru->ap, 0x44E00140, 0x02);
 
 	/* 4. Enable PRU-ICSS module clock (0x44E000E8 = MODULEMODE_ENABLE) */
-	mem_ap_write_u32(pru->ap, 0x44E000E8, 0x02);
+	mem_ap_write_atomic_u32(pru->ap, 0x44E000E8, 0x02);
 
 	/* 5. Enable GPIO1 module clock (0x44E000AC = MODULEMODE_ENABLE) */
-	mem_ap_write_u32(pru->ap, 0x44E000AC, 0x02);
+	mem_ap_write_atomic_u32(pru->ap, 0x44E000AC, 0x02);
 
 	/* 6. Wait for PRU-ICSS module to transition out of disabled state */
 	for (int i = 0; i < 100; i++) {
 		uint32_t clkctrl = 0;
-		if (mem_ap_read_u32(pru->ap, 0x44E000E8, &clkctrl) == ERROR_OK) {
+		if (mem_ap_read_atomic_u32(pru->ap, 0x44E000E8, &clkctrl) == ERROR_OK) {
 			if ((clkctrl & 0x00030000) != 0x00030000 && (clkctrl & 0x03) == 0x02)
 				break;
 		}
@@ -379,7 +379,14 @@ static void ti_pru_ensure_clocks(struct ti_pru_common *pru)
 	}
 
 	/* 7. Configure PRU-ICSS CFG SYSCFG (0x4A326004): NO-IDLE, NO-STANDBY, STANDBY_INIT=0 */
-	mem_ap_write_u32(pru->ap, 0x4A326004, 0x05);
+	mem_ap_write_atomic_u32(pru->ap, 0x4A326004, 0x05);
+
+	/* 8. Enable USR0-3 LED GPIO1_OE outputs (bits 21-24 = 0 for output) */
+	uint32_t gpio1_oe = 0;
+	if (mem_ap_read_atomic_u32(pru->ap, 0x4804C134, &gpio1_oe) == ERROR_OK) {
+		gpio1_oe &= ~((1 << 21) | (1 << 22) | (1 << 23) | (1 << 24));
+		mem_ap_write_atomic_u32(pru->ap, 0x4804C134, gpio1_oe);
+	}
 }
 
 static int ti_pru_examine(struct target *target)
@@ -695,16 +702,29 @@ static const char *ti_pru_get_gdb_arch(const struct target *target)
 	return "pru";
 }
 
+static struct target *get_pru_target(struct command_invocation *cmd)
+{
+	struct target *target = get_current_target_or_null(cmd->ctx);
+	if (target && !strcmp(target_type_name(target), "ti_pru"))
+		return target;
+
+	/* Fallback: find am335x.pru0 target by name */
+	target = get_target("am335x.pru0");
+	if (target && !strcmp(target_type_name(target), "ti_pru"))
+		return target;
+
+	return NULL;
+}
+
 /* Custom TCL Commands */
 COMMAND_HANDLER(ti_pru_handle_dump_regs_command)
 {
-	struct target *target = get_current_target(CMD_CTX);
-	struct ti_pru_common *pru = target_to_pru(target);
-
-	if (pru->common_magic != TI_PRU_COMMON_MAGIC) {
-		command_print(CMD, "Current target is not a TI PRU core");
+	struct target *target = get_pru_target(CMD);
+	if (!target) {
+		command_print(CMD, "Error: No TI PRU target found");
 		return ERROR_FAIL;
 	}
+	struct ti_pru_common *pru = target_to_pru(target);
 
 	uint32_t ctrl = 0, sts = 0, cycles = 0;
 	ti_pru_read_u32(pru, pru->base_addr + PRU_REG_CTRL, &ctrl);
@@ -715,9 +735,10 @@ COMMAND_HANDLER(ti_pru_handle_dump_regs_command)
 	ti_pru_read_u32(pru, pru->dram_addr, &dram0_val);
 
 	uint32_t pc = (sts & 0xFFFF) * 4;
+	bool running = (ctrl & PRU_CTRL_RUNSTATE) != 0;
 	command_print(CMD, "=== %s State (Base: 0x%08" TARGET_PRIxADDR ") ===", target_name(target), pru->base_addr);
 	command_print(CMD, "State: %s | PC: 0x%04" PRIx32 " (byte 0x%08" PRIx32 ") | Cycles: %" PRIu32 " | CTRL: 0x%08" PRIx32,
-		(ctrl & PRU_CTRL_RUNSTATE) ? "RUNNING" : "HALTED",
+		running ? "RUNNING" : "HALTED",
 		(sts & 0xFFFF), pc, cycles, ctrl);
 	command_print(CMD, "Data RAM 0 Heartbeat (0x%08" TARGET_PRIxADDR "): 0x%08" PRIx32 " (%" PRIu32 " iterations)",
 		pru->dram_addr, dram0_val, dram0_val);
@@ -730,15 +751,14 @@ COMMAND_HANDLER(ti_pru_handle_load_command)
 	if (CMD_ARGC < 1)
 		return ERROR_COMMAND_SYNTAX_ERROR;
 
-	struct target *target = get_current_target(CMD_CTX);
+	struct target *target = get_pru_target(CMD);
+	if (!target) {
+		command_print(CMD, "Error: No TI PRU target found");
+		return ERROR_FAIL;
+	}
 	struct ti_pru_common *pru = target_to_pru(target);
 	struct image image;
 	int retval;
-
-	if (pru->common_magic != TI_PRU_COMMON_MAGIC) {
-		command_print(CMD, "Current target is not a TI PRU core");
-		return ERROR_FAIL;
-	}
 
 	image.base_address = 0;
 	image.base_address_set = false;
@@ -786,24 +806,48 @@ COMMAND_HANDLER(ti_pru_handle_load_command)
 	return retval;
 }
 
-static int ti_pru_handle_resume_command(struct command_invocation *cmd)
+COMMAND_HANDLER(ti_pru_handle_resume_command)
 {
-	struct target *target = get_current_target(cmd->ctx);
-	if (strcmp(target_type_name(target), "ti_pru") != 0) {
-		command_print(cmd, "Error: Target is not a ti_pru instance");
+	struct target *target = get_pru_target(CMD);
+	if (!target) {
+		command_print(CMD, "Error: No TI PRU target found");
 		return ERROR_FAIL;
 	}
-	return ti_pru_resume(target, 1, 0, 0, 0);
+	struct ti_pru_common *pru = target_to_pru(target);
+	ti_pru_ensure_clocks(pru);
+
+	/* Enable core: ENABLE | CTR_EN | SOFT_RST_N (0x0000000B) */
+	uint32_t ctrl = PRU_CTRL_CTR_EN | PRU_CTRL_ENABLE | PRU_CTRL_SOFT_RST_N;
+	int retval = ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl);
+	if (retval != ERROR_OK) {
+		command_print(CMD, "Error: Failed to write PRU CTRL register");
+		return retval;
+	}
+	target->state = TARGET_RUNNING;
+	command_print(CMD, "PRU %s resumed (CTRL=0x%08" PRIx32 ")", target_name(target), ctrl);
+	return ERROR_OK;
 }
 
-static int ti_pru_handle_halt_command(struct command_invocation *cmd)
+COMMAND_HANDLER(ti_pru_handle_halt_command)
 {
-	struct target *target = get_current_target(cmd->ctx);
-	if (strcmp(target_type_name(target), "ti_pru") != 0) {
-		command_print(cmd, "Error: Target is not a ti_pru instance");
+	struct target *target = get_pru_target(CMD);
+	if (!target) {
+		command_print(CMD, "Error: No TI PRU target found");
 		return ERROR_FAIL;
 	}
-	return ti_pru_halt(target);
+	struct ti_pru_common *pru = target_to_pru(target);
+
+	uint32_t ctrl = 0;
+	ti_pru_read_u32(pru, pru->base_addr + PRU_REG_CTRL, &ctrl);
+	ctrl &= ~PRU_CTRL_ENABLE;
+	int retval = ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, ctrl);
+	if (retval != ERROR_OK) {
+		command_print(CMD, "Error: Failed to write PRU CTRL register");
+		return retval;
+	}
+	target->state = TARGET_HALTED;
+	command_print(CMD, "PRU %s halted (CTRL=0x%08" PRIx32 ")", target_name(target), ctrl);
+	return ERROR_OK;
 }
 
 static const struct command_registration ti_pru_exec_command_handlers[] = {
