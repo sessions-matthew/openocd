@@ -788,18 +788,22 @@ static int ti_pru_deassert_reset(struct target *target)
 
 static bool ti_pru_is_valid_address(target_addr_t address)
 {
-	/* PRU IRAM (0x0 - 0x1FFF) */
-	if (address < AM335X_PRU_IRAM_SIZE)
+	/* PRU Local IRAM / Data RAM (0x0 - 0x1FFFF) */
+	if (address < 0x20000)
 		return true;
-	/* PRU-ICSS Subsystem space (0x4A300000 - 0x4A37FFFF) */
-	if (address >= 0x4A300000 && address < 0x4A380000)
+	/* PRU-ICSS Subsystem space (0x4A300000 - 0x4A33FFFF) */
+	if (address >= 0x4A300000 && address < 0x4A340000)
 		return true;
-	/* SOC Peripherals & Control Module (0x44E00000 - 0x4C000000) */
-	if (address >= 0x44E00000 && address < 0x4C000000)
+	/* PRCM, Control Module, UART0, GPIO0 (0x44E00000 - 0x44E10000) */
+	if (address >= 0x44E00000 && address < 0x44E10000)
 		return true;
-	/* DDR3 / OCM RAM (0x402F0000 - 0x40310000, 0x80000000 - 0x90000000) */
-	if ((address >= 0x402F0000 && address < 0x40310000) ||
-	    (address >= 0x80000000 && address < 0x90000000))
+	/* GPIO1, GPIO2, GPIO3 (0x4804C000 - 0x4804D000, 0x481AC000 - 0x481B0000) */
+	if ((address >= 0x4804C000 && address < 0x4804D000) ||
+	    (address >= 0x481AC000 && address < 0x481B0000))
+		return true;
+	/* DDR3 RAM (0x80000000 - 0x90000000) / OCM (0x402F0000 - 0x40310000) */
+	if ((address >= 0x80000000 && address < 0x90000000) ||
+	    (address >= 0x402F0000 && address < 0x40310000))
 		return true;
 	return false;
 }
@@ -965,7 +969,12 @@ COMMAND_HANDLER(ti_pru_handle_load_command)
 	if (retval == ERROR_OK) {
 		command_print(CMD, "Loaded %" PRIu32 " bytes of PRU firmware into IRAM (0x%08" TARGET_PRIxADDR ")",
 			total_written, pru->iram_addr);
-		/* Reset Program Counter to 0 */
+		/* Clear all PRU GP registers R0-R31 */
+		for (int r = 0; r < 32; r++) {
+			ti_pru_write_u32(pru, pru->base_addr + PRU_DEBUG_GPREG_BASE + (r * 4), 0);
+		}
+		/* Reset Program Counter to 0 by pulsing reset */
+		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, 0);
 		ti_pru_write_u32(pru, pru->base_addr + PRU_REG_CTRL, PRU_CTRL_SOFT_RST_N);
 	}
 
